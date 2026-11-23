@@ -13,6 +13,10 @@ from typing import Any
 import numpy as np
 import torch
 
+from anemoi.evaluation.derived import base_variables
+from anemoi.evaluation.derived import derive
+from anemoi.evaluation.derived import derived_variable_info
+from anemoi.evaluation.derived import with_derived
 from anemoi.evaluation.frame import Grid
 from anemoi.evaluation.sources.base import MissingTargetError
 from anemoi.evaluation.sources.base import TargetSourceBase
@@ -96,7 +100,8 @@ class DatasetTargets(TargetSourceBase):
         self.args, self.kwargs = tuple(_plain(list(args))), _plain(dict(kwargs))
         self.grid_indices = slice(None) if grid_indices is None else grid_indices
         self.grid = Grid(dataset.latitudes[self.grid_indices], dataset.longitudes[self.grid_indices])
-        self.variables = list(dataset.variables)
+        self.dataset_variables = list(dataset.variables)
+        self.variables = with_derived(self.dataset_variables)
         try:
             self.typed_variables = dict(dataset.typed_variables)
         except (AttributeError, KeyError, TypeError):
@@ -179,9 +184,13 @@ class DatasetTargets(TargetSourceBase):
     def _read(self, key: tuple) -> tuple[np.ndarray, float]:
         """Decoded, variable-selected row and its read time; the only method that touches the dataset after setup."""
         valid_time, variables = key
-        columns = select_variables(list(variables), self.variables)
+        requested = list(variables)
+        base = base_variables(requested, self.dataset_variables)
+        columns = select_variables(base, self.dataset_variables)
         start = time.perf_counter()
         data = self.ds[self._index[valid_time]][columns, 0][:, self.grid_indices]
+        if base != requested:
+            data = derive(np.asarray(data, dtype=np.float32), base, requested)
         return np.ascontiguousarray(data, dtype=np.float32), time.perf_counter() - start
 
     def _store(self, key: tuple, data: np.ndarray) -> None:
@@ -215,6 +224,8 @@ class DatasetTargets(TargetSourceBase):
 
     def variable_info(self, name: str) -> dict:
         """`param` and `level` of a variable from the dataset's typed variables; None when unknown."""
+        if name not in self.typed_variables and derived_variable_info(name) is not None:
+            return derived_variable_info(name)
         return variable_info(self.typed_variables.get(name))
 
     def recorded_variables(self) -> dict:

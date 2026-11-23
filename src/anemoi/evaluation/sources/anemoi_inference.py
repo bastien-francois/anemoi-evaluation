@@ -22,6 +22,10 @@ import torch
 from anemoi.transform.variables import Variable
 from anemoi.utils.dates import frequency_to_string
 
+from anemoi.evaluation.derived import base_variables
+from anemoi.evaluation.derived import derive
+from anemoi.evaluation.derived import derived_variable_info
+from anemoi.evaluation.derived import with_derived
 from anemoi.evaluation.frame import Frame
 from anemoi.evaluation.frame import Grid
 from anemoi.evaluation.sources.base import ForecastSourceBase
@@ -52,6 +56,31 @@ def create_input_state(source: object, init_time: datetime.datetime, lagged: lis
     if "dates" in inspect.signature(source.create_input_state).parameters:
         return source.create_input_state(dates=[init_time + lag for lag in lagged])
     return source.create_input_state(date=init_time)
+
+
+DATE_PLACEHOLDERS = ("yyyy", "mm", "dd", "hh", "yyyymmdd", "yyyymmddhh")
+
+
+def format_init_time(value: object, init_time: datetime.datetime) -> object:
+    """`value` (a config block) with `{yyyy}`, `{mm}`, `{dd}`, `{hh}`, `{yyyymmdd}` and `{yyyymmddhh}` in every string
+    replaced by the fields of `init_time`; other text is kept as is."""
+    if isinstance(value, str):
+        fields = {
+            "yyyy": f"{init_time:%Y}",
+            "mm": f"{init_time:%m}",
+            "dd": f"{init_time:%d}",
+            "hh": f"{init_time:%H}",
+            "yyyymmdd": f"{init_time:%Y%m%d}",
+            "yyyymmddhh": f"{init_time:%Y%m%d%H}",
+        }
+        for key, text in fields.items():
+            value = value.replace("{" + key + "}", text)
+        return value
+    if isinstance(value, Mapping):
+        return {key: format_init_time(item, init_time) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [format_init_time(item, init_time) for item in value]
+    return value
 
 
 def required_dates(
@@ -514,8 +543,13 @@ class InferenceForecastSource(ForecastSourceBase):
         seed: int = 0,
         quiet: bool = True,
         forcings_cache_bytes: int = DEFAULT_FORCINGS_CACHE_BYTES,
+        member_inputs: list[Mapping] | None = None,
         **run_config: object,
     ) -> None:
+        """`member_inputs`: optional list of one anemoi-inference `input` block per member (`members` of them), each
+        with `{yyyy}`, `{mm}`, `{dd}`, `{hh}`, `{yyyymmdd}`, `{yyyymmddhh}` filled in from the init time, from which
+        that member's prognostic input state is read, e.g. one EDA member each, or inputs that change with the init
+        time. Constant and dynamic forcings still come from the runner's `input`. Single-dataset checkpoints only."""
         from anemoi.inference.checkpoint import Checkpoint
         from anemoi.inference.config.run import RunConfiguration
         from anemoi.inference.runners import create_runner
@@ -529,6 +563,9 @@ class InferenceForecastSource(ForecastSourceBase):
             raise ValueError("the inference config's output must be 'none', forecasts stay in memory")
         env = inference_env(run_config)
         self.run_config = {**run_config, **({"env": env} if env else {})}
+        if member_inputs is not None and len(member_inputs) != members:
+            raise ValueError(f"member_inputs has {len(member_inputs)} input blocks for {members} members")
+        self.member_inputs = None if member_inputs is None else [dict(block) for block in member_inputs]
         self.members = members
         self.seed = seed
         self.quiet = quiet
@@ -587,8 +624,11 @@ class InferenceForecastSource(ForecastSourceBase):
         if len(self.dataset_names) == 1:
             self.dataset_name = self.dataset_names[0]
             single = self.datasets[self.dataset_name]
-            self.variables, self.typed_variables = single.variables, single.typed_variables
+            # plus derived variables (10si), computed from the frames in `frames()`
+            self.variables, self.typed_variables = with_derived(single.variables), single.typed_variables
             self.grid_indices, self.grid = single.grid_indices, single.grid
+        elif self.member_inputs is not None:
+            raise ValueError("member_inputs is for single-dataset checkpoints only")
         self.checkpoint_uuid, self.checkpoint_run_id = metadata.get("uuid"), metadata.get("run_id")
         if members > 1 and metadata["config"]["model"].get("noise_injector") is None:
             LOG.warning("%s has no noise injector, its %d members will be identical", self.checkpoint, members)
@@ -782,8 +822,15 @@ class InferenceForecastSource(ForecastSourceBase):
 
         Single-dataset checkpoints only; a multi-dataset checkpoint's rollout is `multi_frames()`."""
         name = self._resolve_dataset(None)
-        for frames in self.multi_frames(init_time, lead_time, {name: variables}, device):
-            yield frames[name]
+        requested = list(variables)
+        base = base_variables(requested, self.datasets[name].variables)
+        for frames in self.multi_frames(init_time, lead_time, {name: base}, device):
+            frame = frames[name]
+            if base == requested:
+                yield frame
+            else:
+                data = derive(frame.data, base, requested).float().contiguous()
+                yield Frame(frame.init_time, frame.lead_time, frame.valid_time, requested, data)
 
     def multi_frames(
         self,
@@ -802,14 +849,21 @@ class InferenceForecastSource(ForecastSourceBase):
         names = list(variables)
         for name in names:
             select_variables(list(variables[name]), self.datasets[self._resolve_dataset(name)].variables)
-        states = {name: self._initial_state(name, init_time) for name in self.dataset_names}
+        members = self._member_indices()
+        if self.member_inputs is None:
+            states = {name: self._initial_state(name, init_time) for name in self.dataset_names}
+            member_states = [states for _ in members]
+        else:
+            member_states = [
+                {self.dataset_name: self._member_input_state(member, init_time)} for member in members
+            ]
         self.runner.reference_date = None
         # The runner enters inference mode inside each generator; interleaved generators exit out of
         # order, so this outer guard is what restores the caller's mode.
         with self._quiet(), torch.inference_mode():
-            members = self._member_indices()
             generators = [
-                self.runner.run(input_states=states, lead_time=lead_time, return_numpy=False) for _ in members
+                self.runner.run(input_states=states, lead_time=lead_time, return_numpy=False)
+                for states in member_states
             ]
             # reseeded before the `next()` that makes a call; every yielded step must be the scheduled one
             schedule = self.rollout_schedule(lead_time)
@@ -878,6 +932,31 @@ class InferenceForecastSource(ForecastSourceBase):
             )
             self._initial[dataset] = (init_time, state)
         return self._initial[dataset][1]
+
+    def member_input_config(self, member: int, init_time: datetime.datetime) -> dict:
+        """The `input` block of `member` at `init_time` (placeholders filled in)."""
+        return format_init_time(self.member_inputs[member], init_time)
+
+    def _member_input(self, member: int, init_time: datetime.datetime) -> object:
+        """A prognostics input of the runner built from the member's `input` block at `init_time`."""
+        from anemoi.inference.inputs import create_input
+        from anemoi.inference.variables import Variables
+
+        metadata = self.runner.checkpoint.multi_dataset_metadata[self.dataset_name]
+        variables = Variables(metadata).retrieved_prognostic_variables()
+        config = self.member_input_config(member, init_time)
+        return create_input(self.runner, config, metadata, variables=variables, purpose="prognostics")
+
+    def _member_input_state(self, member: int, init_time: datetime.datetime) -> dict:
+        """Initial state of `member`: prognostics from its own input, constant and dynamic forcings from the runner's
+        inputs, combined as `_initial_state` does."""
+        runner, name = self.runner, self.dataset_name
+        lagged = runner.checkpoint.multi_dataset_metadata[name].lagged
+        return runner._combine_states(
+            create_input_state(self._member_input(member, init_time), init_time, lagged),
+            create_input_state(runner.constant_forcings_inputs[name], init_time, lagged),
+            create_input_state(runner.dynamic_forcings_inputs[name], init_time, lagged),
+        )
 
     def _window_frames(
         self,
@@ -981,6 +1060,29 @@ class InferenceForecastSource(ForecastSourceBase):
                             f"init time {init_time}: dates {absent[:3]} are not in the {kind} dataset "
                             f"of {name!r} ({dates[0]} to {dates[-1]}, {len(missing)} missing)"
                         )
+        if self.member_inputs is not None:
+            self._check_member_inputs(init_times)
+
+    def _check_member_inputs(self, init_times: list[datetime.datetime]) -> None:
+        """Raise unless every member's own prognostics input has the dates its rollout reads, at every init time."""
+        for init_time in init_times:
+            required = required_dates(init_time, self.input_offsets, self.output_offsets, self.output_horizon)
+            for member in range(self.members):
+                try:
+                    source = self._member_input(member, init_time)
+                    dates = source.ds_dates.astype("datetime64[us]").tolist()
+                    missing = {dates[i] for i in source.ds.missing}
+                except Exception as error:
+                    raise ValueError(
+                        f"init time {init_time}, member {member}: cannot open its input "
+                        f"{self.member_input_config(member, init_time)}: {error}"
+                    ) from error
+                absent = missing_dates(required, set(dates), missing)
+                if absent:
+                    raise ValueError(
+                        f"init time {init_time}, member {member}: dates {absent[:3]} are not in its input "
+                        f"({dates[0]} to {dates[-1]})"
+                    )
 
     def dataset_args_kwargs(self, dataset: str | None = None) -> tuple[tuple, dict]:
         """`open_dataset` arguments of the runner's prognostics input, for targets from the same dataset."""
@@ -1026,6 +1128,8 @@ class InferenceForecastSource(ForecastSourceBase):
 
     def variable_info(self, name: str) -> dict:
         """`param` and `level` of a variable from the checkpoint's typed variables; None when unknown."""
+        if name not in self.typed_variables and derived_variable_info(name) is not None:
+            return derived_variable_info(name)
         return variable_info(self.typed_variables.get(name))
 
     def recorded_variables(self) -> dict:
@@ -1079,6 +1183,7 @@ class InferenceForecastSource(ForecastSourceBase):
                 "seed": self.seed,
                 "quiet": self.quiet,
                 "forcings_cache_bytes": self.forcings_cache_bytes,
+                **({"member_inputs": self.member_inputs} if self.member_inputs is not None else {}),
             }
         }
 
