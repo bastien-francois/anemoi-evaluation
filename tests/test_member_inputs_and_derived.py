@@ -229,3 +229,35 @@ def test_rollout_seeds_give_each_lockstep_member_the_stream_of_its_own_run():
     source.rollout_seeds = None
     default = list(source.frames(init, 18 * HOUR, ["2t"], CPU))
     assert not torch.equal(default[0].data, pair[0].data)
+
+
+def test_boundary_forcings_dates_are_checked_only_when_the_runner_reads_them(monkeypatch):
+    """A checkpoint without an output_mask has no boundary-forcing providers: its boundary input is never read, so
+    a +24h rollout from an input that only covers the initial window must pass the date check."""
+    import anemoi.inference.inputs.dataset
+    import anemoi.inference.inputs.empty
+
+    class FakeDatasetInput:
+        def __init__(self, dates):
+            self.ds_dates = np.array(dates, dtype="datetime64[us]")
+            self.ds = SimpleNamespace(missing=set())
+
+    class FakeEmptyInput:
+        pass
+
+    monkeypatch.setattr(anemoi.inference.inputs.dataset, "DatasetInput", FakeDatasetInput)
+    monkeypatch.setattr(anemoi.inference.inputs.empty, "EmptyInput", FakeEmptyInput)
+    source = member_inputs_source()
+    source.member_inputs = None
+    source.input_offsets = [-6 * HOUR, 0 * HOUR]
+    short = FakeDatasetInput([T0 - 6 * HOUR, T0, T0 + 6 * HOUR])  # the initial window, not a +24h rollout
+    source.runner.prognostics_inputs = {"ds": short}
+    source.runner.dynamic_forcings_inputs = {"ds": FakeEmptyInput()}
+    source.runner.boundary_forcings_inputs = {"ds": short}
+    source.runner.tensor_handlers = {"ds": SimpleNamespace(boundary_forcings_providers=[])}
+    source.check_init_times([T0], 24 * HOUR)  # passes: no output_mask, boundaries never read
+    source.runner.tensor_handlers = {"ds": SimpleNamespace(boundary_forcings_providers=["lam boundary"])}
+    with pytest.raises(ValueError, match="not in the boundary forcings dataset"):
+        source.check_init_times([T0], 24 * HOUR)
+    assert source._reads_boundary_forcings("ds")
+    assert member_inputs_source()._reads_boundary_forcings("ds")  # no tensor handler to ask: unknown counts as yes

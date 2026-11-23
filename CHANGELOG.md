@@ -38,6 +38,13 @@
   records each variable's accumulation `period` next to `param` and `level`, and `merge` refuses inputs
   whose `param`, `level` or `period` disagree.
 
+### Fixes
+
+* The init-time check no longer requires the boundary-forcing dates of a checkpoint without an `output_mask`:
+  anemoi-inference builds no boundary-forcing providers for it and never reads that input, so a rollout longer
+  than the `input` dataset's last date was refused for nothing. `member_inputs` is refused for a checkpoint with
+  boundary forcings, whose boundaries would be read from `input` rather than from each member's input.
+
 ### Changes
 
 * The node reduction and the ensemble mean are taken one variable at a time. Results differ from 0.4.0

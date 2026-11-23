@@ -644,6 +644,12 @@ class InferenceForecastSource(ForecastSourceBase):
                 SharedForcings(p, cache) for p in handler.constant_forcings_providers
             ]
             handler.dynamic_forcings_providers = [SharedForcings(p, cache) for p in handler.dynamic_forcings_providers]
+        if self.member_inputs is not None and any(self._reads_boundary_forcings(n) for n in self.dataset_names):
+            # the boundary values would come from the runner's `input`, not from each member's own input
+            raise ValueError(
+                "member_inputs is not supported for a checkpoint with boundary forcings (an output_mask): its "
+                "boundaries would be read from `input`, not from each member's input"
+            )
         self.checkpoint = self.runner.checkpoint.path
         self.timestep = self.runner.checkpoint.timestep
         self.multi_step_input = self.runner.checkpoint.multi_step_input
@@ -1101,6 +1107,14 @@ class InferenceForecastSource(ForecastSourceBase):
         if yielded != leads:
             raise RuntimeError(f"the runner yielded the steps {yielded} at {init_time}, the window's leads are {leads}")
 
+    def _reads_boundary_forcings(self, dataset: str) -> bool:
+        """Whether the runner reads boundary forcings for `dataset` during the rollout: anemoi-inference builds
+        boundary-forcing providers only for a checkpoint with an `output_mask` (a LAM's boundary); unknown counts as
+        yes."""
+        handler = getattr(self.runner, "tensor_handlers", {}).get(dataset)
+        providers = getattr(handler, "boundary_forcings_providers", None)
+        return True if providers is None else bool(providers)
+
     def check_init_times(
         self, init_times: list[datetime.datetime], lead_time: datetime.timedelta, dataset: str | None = None
     ) -> None:
@@ -1121,6 +1135,8 @@ class InferenceForecastSource(ForecastSourceBase):
                 source = sources[name]
                 if isinstance(source, EmptyInput) or (self.temporal_downscaling and kind == "boundary forcings"):
                     continue
+                if kind == "boundary forcings" and not self._reads_boundary_forcings(name):
+                    continue  # no output_mask: the runner never reads its boundary-forcings input
                 if not isinstance(source, DatasetInput):
                     LOG.warning("%s input %s is not a dataset, init times are not checked against it", kind, source)
                     continue
