@@ -11,6 +11,14 @@
 
 ### Features
 
+* `forecast.anemoi_inference.member_inputs`: one anemoi-inference `input` block per member, with
+  `{yyyy}`, `{mm}`, `{dd}`, `{hh}`, `{yyyymmdd}` and `{yyyymmddhh}` filled in from the init time. Each
+  member's prognostics are read from its own input (EDA members, boundary files per init time); the
+  constant and dynamic forcings still come from `input`. The dates every member input needs are checked
+  at every init time, and each input is opened once per run. Single-dataset checkpoints only.
+* Derived variable `10si = sqrt(10u^2 + 10v^2)`, on the forecast frames and the dataset targets, scored
+  only when `variables` names it; not with `--member-group`.
+
 * New time bins `bins: {time: hour}`, one per hour of day (`00` to `23`); by valid time they give the
   diurnal cycle.
 * `run --member-group` spreads the members of every init time over the tasks of an `srun` or

@@ -16,7 +16,7 @@ import torch
 from anemoi.evaluation.derived import base_variables
 from anemoi.evaluation.derived import derive
 from anemoi.evaluation.derived import derived_variable_info
-from anemoi.evaluation.derived import with_derived
+from anemoi.evaluation.derived import derivable
 from anemoi.evaluation.frame import Grid
 from anemoi.evaluation.sources.base import MissingTargetError
 from anemoi.evaluation.sources.base import TargetSourceBase
@@ -100,8 +100,9 @@ class DatasetTargets(TargetSourceBase):
         self.args, self.kwargs = tuple(_plain(list(args))), _plain(dict(kwargs))
         self.grid_indices = slice(None) if grid_indices is None else grid_indices
         self.grid = Grid(dataset.latitudes[self.grid_indices], dataset.longitudes[self.grid_indices])
-        self.dataset_variables = list(dataset.variables)
-        self.variables = with_derived(self.dataset_variables)
+        self.variables = list(dataset.variables)
+        self.dataset_variables = self.variables
+        self.derived_variables = derivable(self.variables)  # opt-in: only when the config names them
         try:
             self.typed_variables = dict(dataset.typed_variables)
         except (AttributeError, KeyError, TypeError):
@@ -164,7 +165,7 @@ class DatasetTargets(TargetSourceBase):
             raise MissingTargetError(f"no target date {valid_time} in the dataset")
         if index in self._missing:
             raise MissingTargetError(f"target date {valid_time} is missing from the dataset")
-        select_variables(list(variables), self.variables)
+        select_variables(list(variables), self.variables + self.derived_variables)
         key = (valid_time, tuple(variables))
         if key in self._cache:
             self._cache.move_to_end(key)

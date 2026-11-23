@@ -111,8 +111,9 @@ sources share, metrics `rmse`, `mae` and `bias`, the checkpoint's `area_weight` 
 one region `global`, seasonal bins by init time, missing targets skipped, no lead 0. Every key,
 its type and its default are in the [reference](reference.md#top-level-evaluationconfig).
 
-`forecast.anemoi_inference` consumes `members`, `seed`, `quiet` and `forcings_cache_bytes`; every
-other key goes to the anemoi-inference run configuration (`checkpoint`, `device`, `input`, `env`,
+`forecast.anemoi_inference` consumes `members`, `seed`, `quiet`, `forcings_cache_bytes` and
+`member_inputs` (one `input` block per member, see the [reference](reference.md#anemoi_inference-anemoiinferenceconfig-extraallow));
+every other key goes to the anemoi-inference run configuration (`checkpoint`, `device`, `input`, `env`,
 ...), except `date` and a non-`none` `output`, which are refused because init times come from the
 evaluation and forecast fields never leave memory. `targets.anemoi_dataset` consumes `prefetch`
 and `cache_bytes`; every other key goes to `anemoi.datasets.open_dataset`, and an empty block

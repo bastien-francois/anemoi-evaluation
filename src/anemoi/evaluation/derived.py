@@ -2,8 +2,11 @@
 
 anemoi-transform filters (`uv_to_ddff`) cannot be used for this: anemoi-inference applies its post-processors in
 `Runner.execute()`, not in the `Runner.run()` generator the evaluation reads, and `open_dataset` applies no filters.
-A source lists a derived name in its `variables` when it has all its components, reads the components in place of it
-(`base_variables`) and computes it (`derive`) on numpy arrays or torch tensors, on the device of the data.
+
+Opt-in: a source keeps its `variables` as they are (so the default variable set of a run does not change) and lists
+what it can derive from them in `derived_variables`; a derived name is scored only when the config asks for it in
+`variables`. The source reads the components in place of it (`base_variables`) and computes it (`derive`) on numpy
+arrays or torch tensors, on the device of the data.
 """
 
 from __future__ import annotations
@@ -14,11 +17,9 @@ import torch
 DERIVED: dict[str, tuple[str, ...]] = {"10si": ("10u", "10v")}
 
 
-def with_derived(variables: list[str]) -> list[str]:
-    """`variables` plus every derived name whose components are all in it and that it does not already hold."""
-    return list(variables) + [
-        name for name, parts in DERIVED.items() if name not in variables and all(p in variables for p in parts)
-    ]
+def derivable(variables: list[str]) -> list[str]:
+    """The derived names whose components are all in `variables` and that `variables` does not already hold."""
+    return [name for name, parts in DERIVED.items() if name not in variables and all(p in variables for p in parts)]
 
 
 def base_variables(requested: list[str], available: list[str]) -> list[str]:

@@ -202,6 +202,12 @@ one. `linear_interpolation` yields `k * timestep` for `0 < k * timestep < lead_t
 | `seed` | int | 0 | Base seed, see [seeding](#seeding-and-reproducibility). |
 | `quiet` | bool | true | Raise the `anemoi.inference` and `anemoi.utils.timer` loggers to WARNING while the runner runs. |
 | `forcings_cache_bytes` | int >= 0 | `2**30` (1 GiB) | Host LRU budget for computed forcings arrays. `0` disables the cache. |
+| `member_inputs` | list of mappings, or null | null | One anemoi-inference `input` block per member (`members` of them); `{yyyy}`, `{mm}`, `{dd}`, `{hh}`, `{yyyymmdd}`, `{yyyymmddhh}` in its strings are filled in from the init time. Member `m`'s prognostics are read from block `m`; constant and dynamic forcings from `input`. Every member input's dates are checked at every init time; each input is opened once per run. Single-dataset checkpoints only. |
+
+Derived variables: `10si` (`sqrt(10u^2 + 10v^2)`) is delivered by the inference source of a single-dataset
+checkpoint and by the dataset targets when they hold `10u` and `10v`, listed in their `derived_variables`
+rather than `variables`, so it is scored only when the config's `variables` names it. It is not available
+with `--member-group`.
 
 Every other key goes to `anemoi.inference.config.run.RunConfiguration` (`checkpoint`, `device`, `input`,
 `env`, ...). The block is loaded as `{"verbosity": 0, **block, "output": "none"}`: `verbosity: 0` is only

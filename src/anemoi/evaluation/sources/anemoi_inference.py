@@ -25,7 +25,7 @@ from anemoi.utils.dates import frequency_to_string
 from anemoi.evaluation.derived import base_variables
 from anemoi.evaluation.derived import derive
 from anemoi.evaluation.derived import derived_variable_info
-from anemoi.evaluation.derived import with_derived
+from anemoi.evaluation.derived import derivable
 from anemoi.evaluation.frame import Frame
 from anemoi.evaluation.frame import Grid
 from anemoi.evaluation.sources.base import ForecastSourceBase
@@ -624,8 +624,9 @@ class InferenceForecastSource(ForecastSourceBase):
         if len(self.dataset_names) == 1:
             self.dataset_name = self.dataset_names[0]
             single = self.datasets[self.dataset_name]
-            # plus derived variables (10si), computed from the frames in `frames()`
-            self.variables, self.typed_variables = with_derived(single.variables), single.typed_variables
+            self.variables, self.typed_variables = single.variables, single.typed_variables
+            # opt-in derived variables (10si), computed from the frames in `frames()`
+            self.derived_variables = derivable(single.variables)
             self.grid_indices, self.grid = single.grid_indices, single.grid
         elif self.member_inputs is not None:
             raise ValueError("member_inputs is for single-dataset checkpoints only")
@@ -824,6 +825,9 @@ class InferenceForecastSource(ForecastSourceBase):
         name = self._resolve_dataset(None)
         requested = list(variables)
         base = base_variables(requested, self.datasets[name].variables)
+        if base != requested and self.member_group is not None:
+            # a member group's frame holds only the rank's block of the variables, not every component
+            raise ValueError(f"derived variables {[v for v in requested if v not in base]} need an unsplit run")
         for frames in self.multi_frames(init_time, lead_time, {name: base}, device):
             frame = frames[name]
             if base == requested:
@@ -901,19 +905,30 @@ class InferenceForecastSource(ForecastSourceBase):
         dataset: str | None = None,
     ) -> Frame:
         """Lead-0 frame of `dataset`: the init-time slice of every requested variable present in the input state
-        (prognostics), NaN for the others (diagnostics have no analysis), identical for every member."""
+        (prognostics), NaN for the others (diagnostics have no analysis), identical for every member unless
+        `member_inputs` gives each member its own input state; derived variables from their components."""
         if self.temporal_downscaling:
             raise ValueError("a temporal downscaler has no lead-0 frame: lead 0 is its left bound, an input")
         name = self._resolve_dataset(dataset)
         view = self.datasets[name]
-        select_variables(list(variables), view.variables)
-        fields = self._initial_state(name, init_time)["fields"]
-        data = np.full((len(variables), view.grid.n), np.nan, dtype=np.float32)
-        for row, v in zip(data, variables):
-            if v in fields:
-                row[:] = fields[v][-1]
-        data = torch.from_numpy(data).to(device)[None].repeat(self.members, 1, 1)
-        return Frame(init_time, datetime.timedelta(0), init_time, list(variables), data)
+        requested = list(variables)
+        base = base_variables(requested, view.variables)
+        select_variables(base, view.variables)
+        if self.member_inputs is None:
+            member_fields = [self._initial_state(name, init_time)["fields"]]
+        else:
+            member_fields = [self._member_input_state(m, init_time)["fields"] for m in range(self.members)]
+        data = np.full((len(member_fields), len(base), view.grid.n), np.nan, dtype=np.float32)
+        for rows, fields in zip(data, member_fields):
+            for row, v in zip(rows, base):
+                if v in fields:
+                    row[:] = fields[v][-1]
+        data = torch.from_numpy(data).to(device)
+        if self.member_inputs is None:
+            data = data.repeat(self.members, 1, 1)
+        if base != requested:
+            data = derive(data, base, requested).float().contiguous()
+        return Frame(init_time, datetime.timedelta(0), init_time, requested, data)
 
     def _quiet(self) -> contextlib.AbstractContextManager:
         return quiet_inference() if self.quiet else contextlib.nullcontext()
@@ -938,14 +953,20 @@ class InferenceForecastSource(ForecastSourceBase):
         return format_init_time(self.member_inputs[member], init_time)
 
     def _member_input(self, member: int, init_time: datetime.datetime) -> object:
-        """A prognostics input of the runner built from the member's `input` block at `init_time`."""
+        """A prognostics input of the runner built from the member's `input` block at `init_time`; kept until
+        `close()`, so that the date check (every init time, when the evaluation is built) and the rollout open each
+        input once: opening a cutout computes its masks, about 12 s for a 2 km LAM in an N320 grid."""
         from anemoi.inference.inputs import create_input
         from anemoi.inference.variables import Variables
 
-        metadata = self.runner.checkpoint.multi_dataset_metadata[self.dataset_name]
-        variables = Variables(metadata).retrieved_prognostic_variables()
+        cache = self.__dict__.setdefault("_member_input_cache", {})
         config = self.member_input_config(member, init_time)
-        return create_input(self.runner, config, metadata, variables=variables, purpose="prognostics")
+        key = repr(config)  # the formatted block: members or init times that share an input share it
+        if key not in cache:
+            metadata = self.runner.checkpoint.multi_dataset_metadata[self.dataset_name]
+            variables = Variables(metadata).retrieved_prognostic_variables()
+            cache[key] = create_input(self.runner, config, metadata, variables=variables, purpose="prognostics")
+        return cache[key]
 
     def _member_input_state(self, member: int, init_time: datetime.datetime) -> dict:
         """Initial state of `member`: prognostics from its own input, constant and dynamic forcings from the runner's
@@ -1263,6 +1284,7 @@ class InferenceForecastSource(ForecastSourceBase):
     def close(self) -> None:
         """Release the runner and the model."""
         self._initial = {}
+        self.__dict__.pop("_member_input_cache", None)
         if self.temporal_downscaling:
             self._window_constants = {}
         self.runner = None

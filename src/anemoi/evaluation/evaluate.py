@@ -256,8 +256,9 @@ class Evaluation:
         if variables is None:
             variables = [name for name in self.forecast.variables if name in self.targets.variables]
         else:
-            select_variables(list(variables), self.forecast.variables)
-            select_variables(list(variables), self.targets.variables)
+            # derived variables (10si) only when asked for, from the sources that can derive them
+            select_variables(list(variables), self.forecast.variables + getattr(self.forecast, "derived_variables", []))
+            select_variables(list(variables), self.targets.variables + getattr(self.targets, "derived_variables", []))
         if not variables:
             raise ValueError("no variables to evaluate")
         return list(variables)
