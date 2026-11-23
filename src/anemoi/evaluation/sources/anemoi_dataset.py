@@ -14,9 +14,9 @@ import numpy as np
 import torch
 
 from anemoi.evaluation.derived import base_variables
+from anemoi.evaluation.derived import derivable
 from anemoi.evaluation.derived import derive
 from anemoi.evaluation.derived import derived_variable_info
-from anemoi.evaluation.derived import derivable
 from anemoi.evaluation.frame import Grid
 from anemoi.evaluation.sources.base import MissingTargetError
 from anemoi.evaluation.sources.base import TargetSourceBase

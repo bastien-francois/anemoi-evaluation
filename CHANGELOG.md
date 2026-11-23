@@ -13,16 +13,17 @@
 
 * `forecast.anemoi_inference.member_inputs`: one anemoi-inference `input` block per member, with
   `{yyyy}`, `{mm}`, `{dd}`, `{hh}`, `{yyyymmdd}` and `{yyyymmddhh}` filled in from the init time. Each
-  member's prognostics are read from its own input (EDA members, boundary files per init time); the
-  constant and dynamic forcings still come from `input`. The dates every member input needs are checked
-  at every init time, and each input is opened once per run. Single-dataset checkpoints only.
+  member's prognostics, and for a checkpoint with boundary forcings (an `output_mask`) its boundaries at every
+  lead time, are read from its own input (EDA members, initial conditions or boundary files per init time); the
+  constant and dynamic forcings still come from `input`. The dates every anemoi-datasets member input needs
+  are checked at every init time, and each input is opened once per run. Single-dataset checkpoints only.
 * Derived variable `10si = sqrt(10u^2 + 10v^2)`, on the forecast frames and the dataset targets, scored
   only when `variables` names it; not with `--member-group`.
-* `forecast.anemoi_inference.rollout_seeds` (`base`, `init_hours_factor`, `member_offsets`): seeding as
-  anemoi-inference's `seed:`, instead of the per-call hash. Member `m` of init time `t` is seeded once with
-  `base + init_hours_factor * hours since 1970-01-01T00 UTC + member_offsets[m]` and keeps its own random
-  stream across its model calls, so its noise is that of a separate `anemoi-inference run` with that seed.
-  Forecasters only.
+* `forecast.anemoi_inference.seed_mode: per_rollout`: each member is seeded once before its rollout and keeps
+  its own random stream across its model calls, as a separate `anemoi-inference run` with that `seed:`; the
+  default `per_call` reseeding is unchanged. The seed comes from `rollout_seed` (`function` named
+  `package.module:name` or `path/to/file.py:name`, called as `function(init_time, member, **kwargs)`), else
+  from `member_seed(seed, init_time, member)`. Forecasters only.
 
 * New time bins `bins: {time: hour}`, one per hour of day (`00` to `23`); by valid time they give the
   diurnal cycle.
@@ -42,8 +43,7 @@
 
 * The init-time check no longer requires the boundary-forcing dates of a checkpoint without an `output_mask`:
   anemoi-inference builds no boundary-forcing providers for it and never reads that input, so a rollout longer
-  than the `input` dataset's last date was refused for nothing. `member_inputs` is refused for a checkpoint with
-  boundary forcings, whose boundaries would be read from `input` rather than from each member's input.
+  than the `input` dataset's last date was refused for nothing.
 
 ### Changes
 

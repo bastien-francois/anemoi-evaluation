@@ -7,14 +7,18 @@ import copy
 import datetime
 import gc
 import hashlib
+import importlib
+import importlib.util
 import inspect
 import itertools
 import logging
 import math
 import os
 from collections import OrderedDict
+from collections.abc import Callable
 from collections.abc import Iterator
 from collections.abc import Mapping
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -23,9 +27,9 @@ from anemoi.transform.variables import Variable
 from anemoi.utils.dates import frequency_to_string
 
 from anemoi.evaluation.derived import base_variables
+from anemoi.evaluation.derived import derivable
 from anemoi.evaluation.derived import derive
 from anemoi.evaluation.derived import derived_variable_info
-from anemoi.evaluation.derived import derivable
 from anemoi.evaluation.frame import Frame
 from anemoi.evaluation.frame import Grid
 from anemoi.evaluation.sources.base import ForecastSourceBase
@@ -59,20 +63,32 @@ def create_input_state(source: object, init_time: datetime.datetime, lagged: lis
 
 
 def hours_since_epoch(init_time: datetime.datetime) -> int:
-    """Whole hours from 1970-01-01T00 UTC to `init_time` (naive times are UTC), as `date +%s` / 3600 in a shell."""
+    """Whole hours from 1970-01-01T00 UTC to `init_time` (naive times are UTC), as `date +%s` / 3600 in a shell; a
+    helper for `rollout_seed` functions that derive seeds from the init time."""
     if init_time.tzinfo is not None:
         init_time = init_time.astimezone(datetime.timezone.utc).replace(tzinfo=None)
     return int((init_time - datetime.datetime(1970, 1, 1)).total_seconds()) // 3600
 
 
-def rollout_seed(seeds: Mapping, init_time: datetime.datetime, member: int) -> int:
-    """Seed of `member`'s rollout from `init_time` under `rollout_seeds`:
-    `base + init_hours_factor * hours_since_epoch(init_time) + member_offsets[member]`."""
-    return (
-        int(seeds.get("base", 0))
-        + int(seeds.get("init_hours_factor", 0)) * hours_since_epoch(init_time)
-        + int(seeds["member_offsets"][member])
-    )
+def load_function(spec: str) -> Callable:
+    """The object `name` of `package.module:name` or of `path/to/file.py:name` (a path relative to the working
+    directory)."""
+    module_name, colon, name = spec.rpartition(":")
+    if not colon or not module_name or not name:
+        raise ValueError(f"expected 'package.module:name' or 'path/to/file.py:name', got {spec!r}")
+    if module_name.endswith(".py"):
+        path = Path(module_name)
+        loader_spec = importlib.util.spec_from_file_location(f"anemoi_evaluation_user.{path.stem}", path)
+        if loader_spec is None or loader_spec.loader is None or not path.is_file():
+            raise ValueError(f"cannot load {path} for {spec!r}")
+        module = importlib.util.module_from_spec(loader_spec)
+        loader_spec.loader.exec_module(module)
+    else:
+        module = importlib.import_module(module_name)
+    function = getattr(module, name, None)
+    if not callable(function):
+        raise ValueError(f"{module_name} has no callable {name!r}")
+    return function
 
 
 def rng_state(device: torch.device) -> tuple:
@@ -574,7 +590,8 @@ class InferenceForecastSource(ForecastSourceBase):
         quiet: bool = True,
         forcings_cache_bytes: int = DEFAULT_FORCINGS_CACHE_BYTES,
         member_inputs: list[Mapping] | None = None,
-        rollout_seeds: Mapping | None = None,
+        seed_mode: str = "per_call",
+        rollout_seed: Mapping | Callable | None = None,
         **run_config: object,
     ) -> None:
         """`member_inputs`: optional list of one anemoi-inference `input` block per member (`members` of them), each
@@ -582,10 +599,12 @@ class InferenceForecastSource(ForecastSourceBase):
         that member's prognostic input state is read, e.g. one EDA member each, or inputs that change with the init
         time. Constant and dynamic forcings still come from the runner's `input`. Single-dataset checkpoints only.
 
-        `rollout_seeds`: optional `{base, init_hours_factor, member_offsets}` replacing the per-call `member_seed`
-        reseeding: member `m` of init time `t` is seeded once with `rollout_seed(rollout_seeds, t, m)` before its
-        rollout and keeps its own random stream (CPU and device generator states, saved and restored around each of
-        its steps), as one `anemoi-inference run` with `seed:` set to that value. `seed` is then unused."""
+        `seed_mode`: `per_call` (default) reseeds the global RNG before every member's model call with
+        `member_seed(seed, init_time, member, call)`; `per_rollout` seeds member `m` of init time `t` once before its
+        rollout and keeps its own random stream (CPU and device generator states, restored before and saved after
+        each of its steps), as one `anemoi-inference run` with that `seed:`. Its seed is
+        `rollout_seed(t, m, **kwargs)` when `rollout_seed` is given (a callable, or `{function, kwargs}` naming
+        `package.module:name` or `path/to/file.py:name`), else `member_seed(seed, t, m)`. Forecasters only."""
         from anemoi.inference.checkpoint import Checkpoint
         from anemoi.inference.config.run import RunConfiguration
         from anemoi.inference.runners import create_runner
@@ -602,17 +621,19 @@ class InferenceForecastSource(ForecastSourceBase):
         if member_inputs is not None and len(member_inputs) != members:
             raise ValueError(f"member_inputs has {len(member_inputs)} input blocks for {members} members")
         self.member_inputs = None if member_inputs is None else [dict(block) for block in member_inputs]
-        if rollout_seeds is not None:
-            rollout_seeds = dict(rollout_seeds)
-            offsets = list(rollout_seeds.get("member_offsets") or [])
-            if len(offsets) != members:
-                raise ValueError(f"rollout_seeds.member_offsets has {len(offsets)} offsets for {members} members")
-            rollout_seeds = {
-                "base": int(rollout_seeds.get("base", 0)),
-                "init_hours_factor": int(rollout_seeds.get("init_hours_factor", 0)),
-                "member_offsets": [int(o) for o in offsets],
-            }
-        self.rollout_seeds = rollout_seeds
+        if seed_mode not in ("per_call", "per_rollout"):
+            raise ValueError(f"seed_mode must be 'per_call' or 'per_rollout', got {seed_mode!r}")
+        if rollout_seed is not None and seed_mode != "per_rollout":
+            raise ValueError("rollout_seed needs seed_mode='per_rollout'")
+        self.seed_mode = seed_mode
+        self.rollout_seed = rollout_seed if callable(rollout_seed) or rollout_seed is None else dict(rollout_seed)
+        self._rollout_seed_function = None
+        self._rollout_seed_kwargs: dict = {}
+        if callable(rollout_seed):
+            self._rollout_seed_function = rollout_seed
+        elif rollout_seed is not None:
+            self._rollout_seed_function = load_function(str(rollout_seed["function"]))
+            self._rollout_seed_kwargs = dict(rollout_seed.get("kwargs") or {})
         self.members = members
         self.seed = seed
         self.quiet = quiet
@@ -644,12 +665,6 @@ class InferenceForecastSource(ForecastSourceBase):
                 SharedForcings(p, cache) for p in handler.constant_forcings_providers
             ]
             handler.dynamic_forcings_providers = [SharedForcings(p, cache) for p in handler.dynamic_forcings_providers]
-        if self.member_inputs is not None and any(self._reads_boundary_forcings(n) for n in self.dataset_names):
-            # the boundary values would come from the runner's `input`, not from each member's own input
-            raise ValueError(
-                "member_inputs is not supported for a checkpoint with boundary forcings (an output_mask): its "
-                "boundaries would be read from `input`, not from each member's input"
-            )
         self.checkpoint = self.runner.checkpoint.path
         self.timestep = self.runner.checkpoint.timestep
         self.multi_step_input = self.runner.checkpoint.multi_step_input
@@ -658,8 +673,8 @@ class InferenceForecastSource(ForecastSourceBase):
         self.input_offsets = list(self.runner.checkpoint.lagged)
         self.output_offsets = list(self.runner.checkpoint.output_offsets)
         if self.task == "temporal-downscaler":
-            if self.rollout_seeds is not None:
-                raise ValueError("rollout_seeds is for forecasters, a temporal downscaler is seeded per window call")
+            if self.seed_mode == "per_rollout":
+                raise ValueError("seed_mode per_rollout is for forecasters, a temporal downscaler is seeded per call")
             # one window per init time: its outputs come from one model call, placed by `downscaler_window`
             self.temporal_downscaling = True
             self.window, self.window_leads = downscaler_window(self.runner.checkpoint)
@@ -913,19 +928,22 @@ class InferenceForecastSource(ForecastSourceBase):
             states = {name: self._initial_state(name, init_time) for name in self.dataset_names}
             member_states = [states for _ in members]
         else:
-            member_states = [
-                {self.dataset_name: self._member_input_state(member, init_time)} for member in members
-            ]
+            member_states = [{self.dataset_name: self._member_input_state(member, init_time)} for member in members]
+        boundaries, handler = {}, None
+        if self.member_inputs is not None and self._reads_boundary_forcings(self.dataset_name):
+            handler = self.runner.tensor_handlers[self.dataset_name]
+            boundaries = {member: self._member_boundary_forcings(member, init_time) for member in members}
+            runner_boundaries = handler.boundary_forcings_providers
         self.runner.reference_date = None
         # The runner enters inference mode inside each generator; interleaved generators exit out of
         # order, so this outer guard is what restores the caller's mode.
         streams = {}
-        if self.rollout_seeds is not None:
+        if self.seed_mode == "per_rollout":
             rng_device = torch.device(str(self.runner.device))
             # one torch.manual_seed per member rollout, as anemoi-inference's Runner does once per run; each member
             # then keeps its own stream: its generator states are restored before and saved after each of its steps
             for member in members:
-                torch.manual_seed(rollout_seed(self.rollout_seeds, init_time, member))
+                torch.manual_seed(self.member_rollout_seed(init_time, member))
                 streams[member] = rng_state(rng_device)
         with self._quiet(), torch.inference_mode():
             generators = [
@@ -940,6 +958,8 @@ class InferenceForecastSource(ForecastSourceBase):
                     call, lead = schedule[step_index] if step_index < len(schedule) else (None, None)
                     new_call = call is not None and (step_index == 0 or schedule[step_index - 1][0] != call)
                     for member, generator in zip(members, generators):
+                        if boundaries:  # the runner reads the boundaries of the member it advances, at each step
+                            handler.boundary_forcings_providers = boundaries[member]
                         if streams:
                             set_rng_state(streams[member], rng_device)
                             outputs.append(next(generator, None))
@@ -964,6 +984,8 @@ class InferenceForecastSource(ForecastSourceBase):
                 for generator in generators:
                     generator.close()
                 self._initial = {}
+                if boundaries:
+                    handler.boundary_forcings_providers = runner_boundaries
 
     def initial_frame(
         self,
@@ -1016,14 +1038,21 @@ class InferenceForecastSource(ForecastSourceBase):
             self._initial[dataset] = (init_time, state)
         return self._initial[dataset][1]
 
+    def member_rollout_seed(self, init_time: datetime.datetime, member: int) -> int:
+        """The seed of `member`'s rollout from `init_time` under `seed_mode: per_rollout`."""
+        if self._rollout_seed_function is None:
+            return member_seed(self.seed, init_time, member)
+        return int(self._rollout_seed_function(init_time, member, **self._rollout_seed_kwargs))
+
     def member_input_config(self, member: int, init_time: datetime.datetime) -> dict:
         """The `input` block of `member` at `init_time` (placeholders filled in)."""
         return format_init_time(self.member_inputs[member], init_time)
 
     def _member_input(self, member: int, init_time: datetime.datetime) -> object:
-        """A prognostics input of the runner built from the member's `input` block at `init_time`; kept until
-        `close()`, so that the date check (every init time, when the evaluation is built) and the rollout open each
-        input once: opening a cutout computes its masks, about 12 s for a 2 km LAM in an N320 grid."""
+        """An input of the runner built from the member's `input` block at `init_time`, for its prognostics and its
+        boundary forcings (an input's purpose only names it); kept until `close()`, so that the date check (every init
+        time, when the evaluation is built) and the rollout open each input once: opening a cutout computes its masks,
+        which takes seconds on a large grid."""
         from anemoi.inference.inputs import create_input
         from anemoi.inference.variables import Variables
 
@@ -1035,6 +1064,18 @@ class InferenceForecastSource(ForecastSourceBase):
             variables = Variables(metadata).retrieved_prognostic_variables()
             cache[key] = create_input(self.runner, config, metadata, variables=variables, purpose="prognostics")
         return cache[key]
+
+    def _member_boundary_forcings(self, member: int, init_time: datetime.datetime) -> list:
+        """The boundary-forcing providers of `member` at `init_time`, built by the tensor handler from the member's own
+        input as anemoi-inference builds them from `input`, so that a checkpoint with boundary forcings reads them, at
+        every lead time, from that member's input."""
+        handler = self.runner.tensor_handlers[self.dataset_name]
+        runner_input = handler.boundary_forcings_input
+        handler.boundary_forcings_input = self._member_input(member, init_time)
+        try:
+            return handler.create_boundary_forcings_providers()
+        finally:
+            handler.boundary_forcings_input = runner_input
 
     def _member_input_state(self, member: int, init_time: datetime.datetime) -> dict:
         """Initial state of `member`: prognostics from its own input, constant and dynamic forcings from the runner's
@@ -1109,8 +1150,7 @@ class InferenceForecastSource(ForecastSourceBase):
 
     def _reads_boundary_forcings(self, dataset: str) -> bool:
         """Whether the runner reads boundary forcings for `dataset` during the rollout: anemoi-inference builds
-        boundary-forcing providers only for a checkpoint with an `output_mask` (a LAM's boundary); unknown counts as
-        yes."""
+        boundary-forcing providers only for a checkpoint with an `output_mask`; unknown counts as yes."""
         handler = getattr(self.runner, "tensor_handlers", {}).get(dataset)
         providers = getattr(handler, "boundary_forcings_providers", None)
         return True if providers is None else bool(providers)
@@ -1137,6 +1177,8 @@ class InferenceForecastSource(ForecastSourceBase):
                     continue
                 if kind == "boundary forcings" and not self._reads_boundary_forcings(name):
                     continue  # no output_mask: the runner never reads its boundary-forcings input
+                if kind == "boundary forcings" and self.member_inputs is not None:
+                    continue  # each member's boundaries come from its own input, checked below
                 if not isinstance(source, DatasetInput):
                     LOG.warning("%s input %s is not a dataset, init times are not checked against it", kind, source)
                     continue
@@ -1160,15 +1202,29 @@ class InferenceForecastSource(ForecastSourceBase):
                             f"of {name!r} ({dates[0]} to {dates[-1]}, {len(missing)} missing)"
                         )
         if self.member_inputs is not None:
-            self._check_member_inputs(init_times)
+            self._check_member_inputs(init_times, lead_time)
 
-    def _check_member_inputs(self, init_times: list[datetime.datetime]) -> None:
-        """Raise unless every member's own prognostics input has the dates its rollout reads, at every init time."""
+    def _check_member_inputs(self, init_times: list[datetime.datetime], lead_time: datetime.timedelta) -> None:
+        """Raise unless every member's own input opens and, for an anemoi-datasets input, has the dates its rollout
+        reads, at every init time: the input dates, and with boundary forcings the dates of every model call's
+        boundaries too; other input types are opened but their dates are not checked."""
+        from anemoi.inference.inputs.dataset import DatasetInput
+
+        unchecked: set[str] = set()
         for init_time in init_times:
-            required = required_dates(init_time, self.input_offsets, self.output_offsets, self.output_horizon)
+            required = required_dates(
+                init_time,
+                self.input_offsets,
+                self.output_offsets,
+                self.output_horizon,
+                lead_time if self._reads_boundary_forcings(self.dataset_name) else None,
+            )
             for member in range(self.members):
                 try:
                     source = self._member_input(member, init_time)
+                    if not isinstance(source, DatasetInput):
+                        unchecked.add(type(source).__name__)
+                        continue
                     dates = source.ds_dates.astype("datetime64[us]").tolist()
                     missing = {dates[i] for i in source.ds.missing}
                 except Exception as error:
@@ -1182,6 +1238,11 @@ class InferenceForecastSource(ForecastSourceBase):
                         f"init time {init_time}, member {member}: dates {absent[:3]} are not in its input "
                         f"({dates[0]} to {dates[-1]})"
                     )
+        if unchecked:
+            LOG.warning(
+                "member inputs of type %s are not anemoi datasets, init times are not checked against them",
+                ", ".join(sorted(unchecked)),
+            )
 
     def dataset_args_kwargs(self, dataset: str | None = None) -> tuple[tuple, dict]:
         """`open_dataset` arguments of the runner's prognostics input, for targets from the same dataset."""
@@ -1283,9 +1344,15 @@ class InferenceForecastSource(ForecastSourceBase):
                 "quiet": self.quiet,
                 "forcings_cache_bytes": self.forcings_cache_bytes,
                 **({"member_inputs": self.member_inputs} if self.member_inputs is not None else {}),
-                **({"rollout_seeds": self.rollout_seeds} if self.rollout_seeds is not None else {}),
+                **({"seed_mode": self.seed_mode} if self.seed_mode != "per_call" else {}),
+                **({"rollout_seed": self._rollout_seed_config()} if self.rollout_seed is not None else {}),
             }
         }
+
+    def _rollout_seed_config(self) -> dict:
+        if callable(self.rollout_seed):
+            raise ValueError("a rollout_seed callable cannot be serialised, give {function, kwargs} instead")
+        return dict(self.rollout_seed)
 
     def describe(self, dataset: str | None = None) -> dict:
         """Checkpoint, model shape, the runner's dataset range and whether the model is loaded; loads nothing.
@@ -1297,6 +1364,12 @@ class InferenceForecastSource(ForecastSourceBase):
             return {**shared, "datasets": {name: self._describe_dataset(name) for name in self.dataset_names}}
         name = self._resolve_dataset(dataset)
         return {**shared, **self._describe_dataset(name)}
+
+    def _describe_rollout_seed(self) -> object:
+        function = self._rollout_seed_function
+        if callable(self.rollout_seed):
+            return getattr(function, "__qualname__", repr(function))
+        return dict(self.rollout_seed)
 
     def _describe_shared(self) -> dict:
         """The half of `describe` that is the same for every dataset of the checkpoint."""
@@ -1318,7 +1391,9 @@ class InferenceForecastSource(ForecastSourceBase):
             ),
             "output_horizon": frequency_to_string(self.output_horizon),
             "members": self.members,
-            **({"seed": self.seed} if self.rollout_seeds is None else {"rollout_seeds": self.rollout_seeds}),
+            "seed": self.seed,
+            "seed_mode": self.seed_mode,
+            **({"rollout_seed": self._describe_rollout_seed()} if self.rollout_seed is not None else {}),
             "device": str(self.device),
             "model_loaded": self.model_loaded,
             "forcings_cache_bytes": self.forcings_cache_bytes,

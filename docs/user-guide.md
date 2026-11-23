@@ -112,7 +112,7 @@ one region `global`, seasonal bins by init time, missing targets skipped, no lea
 its type and its default are in the [reference](reference.md#top-level-evaluationconfig).
 
 `forecast.anemoi_inference` consumes `members`, `seed`, `quiet`, `forcings_cache_bytes`,
-`member_inputs` (one `input` block per member) and `rollout_seeds` (anemoi-inference-style seeds), see the
+`member_inputs` (one `input` block per member), `seed_mode` and `rollout_seed` (anemoi-inference-style seeds), see the
 [reference](reference.md#anemoi_inference-anemoiinferenceconfig-extraallow);
 every other key goes to the anemoi-inference run configuration (`checkpoint`, `device`, `input`, `env`,
 ...), except `date` and a non-`none` `output`, which are refused because init times come from the
@@ -304,19 +304,29 @@ The global RNG is reseeded before every member's model call with a hash of
 members: member 2 of a 4-member run is bit-identical to member 2 of an 8-member run with the same
 seed.
 
-To reproduce separate `anemoi-inference run`s instead, one per member with its own `seed:`, give the seeds
-with `rollout_seeds`: member `m` of init time `t` is seeded once with
-`base + init_hours_factor * (hours since 1970-01-01T00 UTC of t) + member_offsets[m]` and keeps its own random
-stream across its model calls, as one inference run does:
+To reproduce separate `anemoi-inference run`s instead, one per member with its own `seed:`, set
+`seed_mode: per_rollout`: member `m` of init time `t` is seeded once before its rollout and keeps its own random
+stream across its model calls, as one inference run does. The seeds are those of `member_seed(seed, t, m)`,
+or, to match the seeds the inference runs were given, those of a function of your own:
 
 ```yaml
 forecast:
   anemoi_inference:
     members: 5
-    rollout_seeds:            # the seed of member m: 16014075 + 10 * hours(t) + (m + 1)
-      base: 16014075
-      init_hours_factor: 10
-      member_offsets: [1, 2, 3, 4, 5]
+    seed_mode: per_rollout
+    rollout_seed:
+      function: my_seeds.py:seed     # or my_package.seeds:seed
+      kwargs: {base: 1000, member_offsets: [1, 2, 3, 4, 5]}
+```
+
+```python
+# my_seeds.py, next to the config (paths are relative to the working directory)
+from anemoi.evaluation.sources.anemoi_inference import hours_since_epoch
+
+
+def seed(init_time, member, base, member_offsets):
+    """The seed an inference script gave member `member` of `init_time`."""
+    return base + 10 * hours_since_epoch(init_time) + member_offsets[member]
 ```
 
 The ensemble noise injector draws the full noise tensor on every rank, so the noise does not depend on how

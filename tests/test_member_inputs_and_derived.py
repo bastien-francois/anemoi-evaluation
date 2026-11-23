@@ -15,7 +15,7 @@ from anemoi.evaluation.sources.anemoi_inference import InferenceForecastSource
 from anemoi.evaluation.sources.anemoi_inference import format_init_time
 
 HOUR = datetime.timedelta(hours=1)
-T0 = datetime.datetime(2026, 7, 2)
+T0 = datetime.datetime(2024, 1, 2)
 CPU = torch.device("cpu")
 N = 5
 
@@ -69,12 +69,12 @@ def test_dataset_targets_derive_10si_only_when_asked():
 
 
 def test_format_init_time_and_member_inputs_config():
-    block = {"dataset": {"cutout": ["/a/mbr001.zarr", "/lbc/{yyyy}/{mm}/{dd}/lbc_{yyyymmdd}_{hh}_mbr001.zarr"]}, "n": 1}
+    block = {"dataset": {"cutout": ["/data/m1.zarr", "/boundary/{yyyy}/{mm}/{dd}/bc_{yyyymmdd}_{hh}_m1.zarr"]}, "n": 1}
     assert format_init_time(block, T0 + 12 * HOUR) == {
-        "dataset": {"cutout": ["/a/mbr001.zarr", "/lbc/2026/07/02/lbc_20260702_12_mbr001.zarr"]},
+        "dataset": {"cutout": ["/data/m1.zarr", "/boundary/2024/01/02/bc_20240102_12_m1.zarr"]},
         "n": 1,
     }
-    assert format_init_time("{yyyymmddhh}", T0) == "2026070200"
+    assert format_init_time("{yyyymmddhh}", T0) == "2024010200"
     config = AnemoiInferenceConfig.model_validate({"checkpoint": "x", "members": 2, "member_inputs": [block, block]})
     assert config.member_inputs == [block, block]
     with pytest.raises(ValueError, match="2 input blocks for 3 members"):
@@ -118,9 +118,10 @@ def member_inputs_source(members: int = 2) -> InferenceForecastSource:
     source = InferenceForecastSource.__new__(InferenceForecastSource)
     source.dataset_names, source.dataset_name = ["ds"], "ds"
     source.datasets = {"ds": SimpleNamespace(variables=["10u", "10v", "2t"], grid=SimpleNamespace(n=N))}
-    source.member_inputs = [{"dataset": f"/mbr00{m + 1}/{{yyyymmdd}}{{hh}}.zarr"} for m in range(members)]
+    source.member_inputs = [{"dataset": f"/m{m + 1}/{{yyyymmdd}}{{hh}}.zarr"} for m in range(members)]
     source.members, source.member_group, source.seed, source.quiet = members, None, 0, False
-    source.rollout_seeds = None
+    source.seed_mode, source.rollout_seed = "per_call", None
+    source._rollout_seed_function, source._rollout_seed_kwargs = None, {}
     source.temporal_downscaling = False
     source.output_offsets, source.output_horizon = [6 * HOUR], 6 * HOUR
     source._initial = {}
@@ -132,6 +133,7 @@ def member_inputs_source(members: int = 2) -> InferenceForecastSource:
         run=fake_run,
         reference_date=None,
         device=torch.device("cpu"),
+        tensor_handlers={"ds": SimpleNamespace(boundary_forcings_providers=[])},
     )
     source._member_input = lambda member, init_time: FakeInput(member, init_time)
     return source
@@ -139,7 +141,7 @@ def member_inputs_source(members: int = 2) -> InferenceForecastSource:
 
 def test_member_inputs_give_each_member_its_own_initial_state_and_10si():
     source = member_inputs_source()
-    assert source.member_input_config(1, T0 + 12 * HOUR) == {"dataset": "/mbr002/2026070212.zarr"}
+    assert source.member_input_config(1, T0 + 12 * HOUR) == {"dataset": "/m2/2024010212.zarr"}
     frames = list(source.frames(T0 + 12 * HOUR, 12 * HOUR, ["2t", "10si"], CPU))
     assert [f.lead_time for f in frames] == [6 * HOUR, 12 * HOUR] and frames[0].variables == ["2t", "10si"]
     for k, frame in enumerate(frames, start=1):
@@ -174,30 +176,54 @@ def test_member_inputs_are_opened_once(monkeypatch):
     del source._member_input  # the real method, not the fake
     first = source._member_input(0, T0)
     assert source._member_input(0, T0) is first and source._member_input(1, T0) is not first
-    assert source._member_input(0, T0 + 24 * HOUR).config == {"dataset": "/mbr001/2026070300.zarr"}
+    assert source._member_input(0, T0 + 24 * HOUR).config == {"dataset": "/m1/2024010300.zarr"}
     assert len(opened) == 3
 
 
-# the inference script's seeds: BASE_SEED + init_hours * 10 + k, k = member slot 1..5 (from its output file names)
-INFERENCE_SEEDS = {"base": 16014075, "init_hours_factor": 10, "member_offsets": [1, 2, 3, 4, 5]}
+SEED_FILE = '''
+from anemoi.evaluation.sources.anemoi_inference import hours_since_epoch
 
 
-def test_rollout_seed_reproduces_the_inference_script_seeds():
+def seed(init_time, member, base=0, member_offsets=()):
+    """A per-run seed scheme of an inference script: base + 10 * hours since 1970 + member slot."""
+    return base + 10 * hours_since_epoch(init_time) + member_offsets[member]
+'''
+
+
+def test_rollout_seed_functions_from_a_file_or_a_module(tmp_path, monkeypatch):
     from anemoi.evaluation.sources.anemoi_inference import hours_since_epoch
-    from anemoi.evaluation.sources.anemoi_inference import rollout_seed
+    from anemoi.evaluation.sources.anemoi_inference import load_function
 
     assert hours_since_epoch(datetime.datetime(1970, 1, 2, 6)) == 30
-    assert rollout_seed(INFERENCE_SEEDS, datetime.datetime(2026, 7, 2), 0) == 20966716  # 2026070200_mbr001_k1
-    assert rollout_seed(INFERENCE_SEEDS, datetime.datetime(2026, 7, 4), 1) == 20967197  # 2026070400_mbr002_k2
-    assert rollout_seed(INFERENCE_SEEDS, datetime.datetime(2026, 7, 7), 4) == 20967920  # 2026070700_mbr005_k5
-    aware = datetime.datetime(2026, 7, 4, 2, tzinfo=datetime.timezone(datetime.timedelta(hours=2)))
-    assert hours_since_epoch(aware) == hours_since_epoch(datetime.datetime(2026, 7, 4))
-    config = AnemoiInferenceConfig.model_validate({"checkpoint": "x", "members": 5, "rollout_seeds": INFERENCE_SEEDS})
-    assert config.rollout_seeds.member_offsets == [1, 2, 3, 4, 5]
-    with pytest.raises(ValueError, match="2 offsets for 5 members"):
-        AnemoiInferenceConfig.model_validate(
-            {"checkpoint": "x", "members": 5, "rollout_seeds": {"member_offsets": [1, 2]}}
-        )
+    aware = datetime.datetime(2024, 1, 4, 2, tzinfo=datetime.timezone(datetime.timedelta(hours=2)))
+    assert hours_since_epoch(aware) == hours_since_epoch(datetime.datetime(2024, 1, 4))
+    (tmp_path / "my_seeds.py").write_text(SEED_FILE)
+    from_file = load_function(f"{tmp_path}/my_seeds.py:seed")
+    assert from_file(datetime.datetime(2024, 1, 2), 1, base=1000, member_offsets=[1, 2]) == 1000 + 10 * 473376 + 2
+    monkeypatch.syspath_prepend(str(tmp_path))
+    assert load_function("my_seeds:seed")(datetime.datetime(2024, 1, 2), 0, member_offsets=[5]) == 10 * 473376 + 5
+    for bad in ("my_seeds", "my_seeds:missing", f"{tmp_path}/nope.py:seed"):
+        with pytest.raises(ValueError):
+            load_function(bad)
+    block = {"function": f"{tmp_path}/my_seeds.py:seed", "kwargs": {"base": 1000, "member_offsets": [1, 2]}}
+    config = AnemoiInferenceConfig.model_validate(
+        {"checkpoint": "x", "seed_mode": "per_rollout", "rollout_seed": block}
+    )
+    assert config.rollout_seed.kwargs == {"base": 1000, "member_offsets": [1, 2]}
+    assert AnemoiInferenceConfig.model_validate({"checkpoint": "x"}).seed_mode == "per_call"
+    with pytest.raises(ValueError, match="needs seed_mode: per_rollout"):
+        AnemoiInferenceConfig.model_validate({"checkpoint": "x", "rollout_seed": block})
+    with pytest.raises(ValueError):
+        AnemoiInferenceConfig.model_validate({"checkpoint": "x", "seed_mode": "per_member"})
+    # the config written to the result file: a {function, kwargs} block, never a callable
+    source = member_inputs_source()
+    source.run_config, source.forcings_cache_bytes = {"checkpoint": "x"}, 0
+    source.seed_mode, source.rollout_seed = "per_rollout", block
+    written = source.to_config()["anemoi_inference"]
+    assert written["seed_mode"] == "per_rollout" and written["rollout_seed"] == block
+    source.rollout_seed = from_file
+    with pytest.raises(ValueError, match="cannot be serialised"):
+        source.to_config()
 
 
 def noisy_run(input_states, lead_time, return_numpy):
@@ -208,25 +234,35 @@ def noisy_run(input_states, lead_time, return_numpy):
         yield {"ds": {"step": 6 * k * HOUR, "date": state["date"] + 6 * k * HOUR, "fields": {"2t": noise}}}
 
 
-def test_rollout_seeds_give_each_lockstep_member_the_stream_of_its_own_run():
+def test_per_rollout_seeding_gives_each_lockstep_member_the_stream_of_its_own_run():
+    from anemoi.evaluation.sources.anemoi_inference import member_seed
+
     source = member_inputs_source(members=3)
     source.runner.run = noisy_run
-    source.rollout_seeds = {"base": 16014075, "init_hours_factor": 10, "member_offsets": [1, 2, 3]}
-    init = datetime.datetime(2026, 7, 4)
+    source.seed_mode = "per_rollout"
+    source._rollout_seed_function, source._rollout_seed_kwargs = (
+        (lambda init_time, member, base: base + member),
+        {"base": 1000},
+    )
+    init = datetime.datetime(2024, 1, 4)
     frames = list(source.frames(init, 18 * HOUR, ["2t"], CPU))  # 3 steps, members interleaved step by step
     for m in range(3):
-        torch.manual_seed(16014075 + 10 * 495312 + m + 1)  # the seed of that member's own anemoi-inference run
+        torch.manual_seed(1000 + m)  # the seed of that member's own anemoi-inference run
         alone = [torch.randn(N) for _ in range(3)]
         for frame, expected in zip(frames, alone):
             torch.testing.assert_close(frame.data[m, 0], expected, rtol=0, atol=0)
     # a member's stream depends on its own seed only: dropping a member leaves the others unchanged
     source.members, source.member_inputs = 2, source.member_inputs[:2]
-    source.rollout_seeds = {**source.rollout_seeds, "member_offsets": [1, 2]}
     pair = list(source.frames(init, 18 * HOUR, ["2t"], CPU))
     for frame, three in zip(pair, frames):
         torch.testing.assert_close(frame.data, three.data[:2], rtol=0, atol=0)
+    # without a function, member m's rollout is seeded with member_seed(seed, init time, m)
+    source._rollout_seed_function = None
+    hashed = list(source.frames(init, 18 * HOUR, ["2t"], CPU))
+    torch.manual_seed(member_seed(source.seed, init, 1))
+    torch.testing.assert_close(hashed[0].data[1, 0], torch.randn(N), rtol=0, atol=0)
     # the default per-call reseeding draws different noise
-    source.rollout_seeds = None
+    source.seed_mode = "per_call"
     default = list(source.frames(init, 18 * HOUR, ["2t"], CPU))
     assert not torch.equal(default[0].data, pair[0].data)
 
@@ -256,8 +292,80 @@ def test_boundary_forcings_dates_are_checked_only_when_the_runner_reads_them(mon
     source.runner.boundary_forcings_inputs = {"ds": short}
     source.runner.tensor_handlers = {"ds": SimpleNamespace(boundary_forcings_providers=[])}
     source.check_init_times([T0], 24 * HOUR)  # passes: no output_mask, boundaries never read
-    source.runner.tensor_handlers = {"ds": SimpleNamespace(boundary_forcings_providers=["lam boundary"])}
+    source.runner.tensor_handlers = {"ds": SimpleNamespace(boundary_forcings_providers=["boundary"])}
     with pytest.raises(ValueError, match="not in the boundary forcings dataset"):
         source.check_init_times([T0], 24 * HOUR)
     assert source._reads_boundary_forcings("ds")
-    assert member_inputs_source()._reads_boundary_forcings("ds")  # no tensor handler to ask: unknown counts as yes
+    unknown = member_inputs_source()
+    del unknown.runner.tensor_handlers
+    assert unknown._reads_boundary_forcings("ds")  # no tensor handler to ask: unknown counts as yes
+
+
+def test_member_inputs_of_other_types_are_opened_but_not_date_checked(monkeypatch, caplog):
+    import logging
+
+    import anemoi.inference.inputs.dataset
+
+    class FakeDatasetInput:
+        def __init__(self, dates):
+            self.ds_dates = np.array(dates, dtype="datetime64[us]")
+            self.ds = SimpleNamespace(missing=set())
+
+    monkeypatch.setattr(anemoi.inference.inputs.dataset, "DatasetInput", FakeDatasetInput)
+    source = member_inputs_source()
+    source.input_offsets = [-6 * HOUR, 0 * HOUR]
+    other = SimpleNamespace()  # e.g. a GRIB input: opened, its dates unknown to the check
+    source._member_input = lambda member, init_time: other if member == 0 else FakeDatasetInput([T0 - 6 * HOUR, T0])
+    with caplog.at_level(logging.WARNING):
+        source._check_member_inputs([T0], 6 * HOUR)
+    assert "SimpleNamespace" in caplog.text and "not anemoi datasets" in caplog.text
+    source._member_input = lambda member, init_time: FakeDatasetInput([T0])  # the t-6h input date is missing
+    with pytest.raises(ValueError, match="member 0: dates"):
+        source._check_member_inputs([T0], 6 * HOUR)
+
+
+def test_member_inputs_give_each_member_its_own_boundary_forcings(monkeypatch):
+    """A checkpoint with boundary forcings (an output_mask) reads them at every step from the tensor handler's
+    providers: each member must advance with the providers built from its own input, which must cover the rollout."""
+    source = member_inputs_source()
+    seen = []
+
+    class FakeHandler:
+        boundary_forcings_input = "runner input"
+        boundary_forcings_providers = ["runner boundaries"]
+
+        def create_boundary_forcings_providers(self):
+            return [("boundaries", self.boundary_forcings_input.member, self.boundary_forcings_input.init_time)]
+
+    handler = FakeHandler()
+    source.runner.tensor_handlers = {"ds": handler}
+
+    def run(input_states, lead_time, return_numpy):
+        state = input_states["ds"]
+        for k in range(1, int(lead_time / (6 * HOUR)) + 1):
+            seen.append(list(handler.boundary_forcings_providers))  # what this step's boundaries are read from
+            fields = {v: torch.as_tensor(x[-1]) + k for v, x in state["fields"].items()}
+            yield {"ds": {"step": 6 * k * HOUR, "date": state["date"] + 6 * k * HOUR, "fields": fields}}
+
+    source.runner.run = run
+    frames = list(source.frames(T0, 12 * HOUR, ["2t"], CPU))
+    assert len(frames) == 2
+    assert seen == [[("boundaries", m, T0)] for _ in range(2) for m in range(2)]  # step by step, member by member
+    assert handler.boundary_forcings_providers == ["runner boundaries"]
+    assert handler.boundary_forcings_input == "runner input"
+
+    import anemoi.inference.inputs.dataset
+
+    class FakeDatasetInput:
+        def __init__(self, dates):
+            self.ds_dates = np.array(dates, dtype="datetime64[us]")
+            self.ds = SimpleNamespace(missing=set())
+
+    monkeypatch.setattr(anemoi.inference.inputs.dataset, "DatasetInput", FakeDatasetInput)
+    source.input_offsets = [-6 * HOUR, 0 * HOUR]
+    source._member_input = lambda member, init_time: FakeDatasetInput([T0 - 6 * HOUR, T0, T0 + 6 * HOUR])
+    source._check_member_inputs([T0], 12 * HOUR)  # boundaries at +6h, read before the second call: covered
+    with pytest.raises(ValueError, match="member 0: dates"):
+        source._check_member_inputs([T0], 18 * HOUR)  # +12h boundaries missing
+    handler.boundary_forcings_providers = []  # no output_mask: only the input window is needed
+    source._check_member_inputs([T0], 18 * HOUR)

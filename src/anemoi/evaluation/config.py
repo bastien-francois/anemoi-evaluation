@@ -115,42 +115,39 @@ class InitTimesList(_Model):
 InitTimesConfig = InitTimesRange | InitTimesList
 
 
-class RolloutSeedsConfig(_Model):
-    """anemoi-inference-style seeding: member `m` of init time `t` is seeded once, `torch.manual_seed(base +
-    init_hours_factor * hours(t) + member_offsets[m])` with `hours(t)` the whole hours since 1970-01-01T00 UTC, before
-    its rollout, and keeps its own random stream across its model calls; the seed of a single `anemoi-inference run`
-    with `seed:` set to that value."""
+class RolloutSeedConfig(_Model):
+    """A user function giving the seed of each member's rollout, `function(init_time, member, **kwargs) -> int`,
+    named `package.module:name` or `path/to/file.py:name` (a path relative to the working directory)."""
 
-    base: int = 0
-    init_hours_factor: int = 0
-    member_offsets: list[int]
+    function: str
+    kwargs: dict[str, Any] = Field(default_factory=dict)
 
 
 class AnemoiInferenceConfig(BaseModel):
-    """The `anemoi_inference` block: `members`, `seed`, `quiet`, `forcings_cache_bytes`, `member_inputs` and
-    `rollout_seeds`, the rest goes to the runner configuration."""
+    """The `anemoi_inference` block: `members`, `seed`, `seed_mode`, `rollout_seed`, `quiet`, `forcings_cache_bytes`
+    and `member_inputs`, the rest goes to the runner configuration."""
 
     model_config = ConfigDict(extra="allow")
 
     members: int = Field(1, ge=1)
     seed: int = 0
+    # per_call: reseed before every member's model call with member_seed(seed, init time, member, call);
+    # per_rollout: seed each member once before its rollout and keep its own random stream, as one `anemoi-inference
+    # run` with that `seed:`, the seed from `rollout_seed`'s function or else member_seed(seed, init time, member)
+    seed_mode: Literal["per_call", "per_rollout"] = "per_call"
+    rollout_seed: RolloutSeedConfig | None = None
     quiet: bool = True
     forcings_cache_bytes: int = Field(2**30, ge=0)
     # one anemoi-inference `input` block per member, `{yyyy}`, `{mm}`, `{dd}`, `{hh}`, `{yyyymmdd}` and `{yyyymmddhh}`
     # filled in from the init time: each member's prognostics are read from its own input
     member_inputs: list[dict] | None = None
-    # instead of `seed`'s per-call hash: one torch.manual_seed per member rollout, as anemoi-inference's `seed:`
-    rollout_seeds: RolloutSeedsConfig | None = None
 
     @model_validator(mode="after")
     def _member_inputs_per_member(self) -> AnemoiInferenceConfig:
         if self.member_inputs is not None and len(self.member_inputs) != self.members:
             raise ValueError(f"member_inputs has {len(self.member_inputs)} input blocks for {self.members} members")
-        if self.rollout_seeds is not None and len(self.rollout_seeds.member_offsets) != self.members:
-            raise ValueError(
-                f"rollout_seeds.member_offsets has {len(self.rollout_seeds.member_offsets)} offsets for "
-                f"{self.members} members"
-            )
+        if self.rollout_seed is not None and self.seed_mode != "per_rollout":
+            raise ValueError("rollout_seed needs seed_mode: per_rollout")
         return self
 
 
