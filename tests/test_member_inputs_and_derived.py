@@ -120,6 +120,7 @@ def member_inputs_source(members: int = 2) -> InferenceForecastSource:
     source.datasets = {"ds": SimpleNamespace(variables=["10u", "10v", "2t"], grid=SimpleNamespace(n=N))}
     source.member_inputs = [{"dataset": f"/mbr00{m + 1}/{{yyyymmdd}}{{hh}}.zarr"} for m in range(members)]
     source.members, source.member_group, source.seed, source.quiet = members, None, 0, False
+    source.rollout_seeds = None
     source.temporal_downscaling = False
     source.output_offsets, source.output_horizon = [6 * HOUR], 6 * HOUR
     source._initial = {}
@@ -130,6 +131,7 @@ def member_inputs_source(members: int = 2) -> InferenceForecastSource:
         _combine_states=combine,
         run=fake_run,
         reference_date=None,
+        device=torch.device("cpu"),
     )
     source._member_input = lambda member, init_time: FakeInput(member, init_time)
     return source
@@ -174,3 +176,56 @@ def test_member_inputs_are_opened_once(monkeypatch):
     assert source._member_input(0, T0) is first and source._member_input(1, T0) is not first
     assert source._member_input(0, T0 + 24 * HOUR).config == {"dataset": "/mbr001/2026070300.zarr"}
     assert len(opened) == 3
+
+
+# the inference script's seeds: BASE_SEED + init_hours * 10 + k, k = member slot 1..5 (from its output file names)
+INFERENCE_SEEDS = {"base": 16014075, "init_hours_factor": 10, "member_offsets": [1, 2, 3, 4, 5]}
+
+
+def test_rollout_seed_reproduces_the_inference_script_seeds():
+    from anemoi.evaluation.sources.anemoi_inference import hours_since_epoch
+    from anemoi.evaluation.sources.anemoi_inference import rollout_seed
+
+    assert hours_since_epoch(datetime.datetime(1970, 1, 2, 6)) == 30
+    assert rollout_seed(INFERENCE_SEEDS, datetime.datetime(2026, 7, 2), 0) == 20966716  # 2026070200_mbr001_k1
+    assert rollout_seed(INFERENCE_SEEDS, datetime.datetime(2026, 7, 4), 1) == 20967197  # 2026070400_mbr002_k2
+    assert rollout_seed(INFERENCE_SEEDS, datetime.datetime(2026, 7, 7), 4) == 20967920  # 2026070700_mbr005_k5
+    aware = datetime.datetime(2026, 7, 4, 2, tzinfo=datetime.timezone(datetime.timedelta(hours=2)))
+    assert hours_since_epoch(aware) == hours_since_epoch(datetime.datetime(2026, 7, 4))
+    config = AnemoiInferenceConfig.model_validate({"checkpoint": "x", "members": 5, "rollout_seeds": INFERENCE_SEEDS})
+    assert config.rollout_seeds.member_offsets == [1, 2, 3, 4, 5]
+    with pytest.raises(ValueError, match="2 offsets for 5 members"):
+        AnemoiInferenceConfig.model_validate(
+            {"checkpoint": "x", "members": 5, "rollout_seeds": {"member_offsets": [1, 2]}}
+        )
+
+
+def noisy_run(input_states, lead_time, return_numpy):
+    """Each step draws its noise from the global generator, as the model's noise injector does."""
+    state = input_states["ds"]
+    for k in range(1, int(lead_time / (6 * HOUR)) + 1):
+        noise = torch.randn(N)
+        yield {"ds": {"step": 6 * k * HOUR, "date": state["date"] + 6 * k * HOUR, "fields": {"2t": noise}}}
+
+
+def test_rollout_seeds_give_each_lockstep_member_the_stream_of_its_own_run():
+    source = member_inputs_source(members=3)
+    source.runner.run = noisy_run
+    source.rollout_seeds = {"base": 16014075, "init_hours_factor": 10, "member_offsets": [1, 2, 3]}
+    init = datetime.datetime(2026, 7, 4)
+    frames = list(source.frames(init, 18 * HOUR, ["2t"], CPU))  # 3 steps, members interleaved step by step
+    for m in range(3):
+        torch.manual_seed(16014075 + 10 * 495312 + m + 1)  # the seed of that member's own anemoi-inference run
+        alone = [torch.randn(N) for _ in range(3)]
+        for frame, expected in zip(frames, alone):
+            torch.testing.assert_close(frame.data[m, 0], expected, rtol=0, atol=0)
+    # a member's stream depends on its own seed only: dropping a member leaves the others unchanged
+    source.members, source.member_inputs = 2, source.member_inputs[:2]
+    source.rollout_seeds = {**source.rollout_seeds, "member_offsets": [1, 2]}
+    pair = list(source.frames(init, 18 * HOUR, ["2t"], CPU))
+    for frame, three in zip(pair, frames):
+        torch.testing.assert_close(frame.data, three.data[:2], rtol=0, atol=0)
+    # the default per-call reseeding draws different noise
+    source.rollout_seeds = None
+    default = list(source.frames(init, 18 * HOUR, ["2t"], CPU))
+    assert not torch.equal(default[0].data, pair[0].data)

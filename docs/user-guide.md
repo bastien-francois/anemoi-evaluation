@@ -111,8 +111,9 @@ sources share, metrics `rmse`, `mae` and `bias`, the checkpoint's `area_weight` 
 one region `global`, seasonal bins by init time, missing targets skipped, no lead 0. Every key,
 its type and its default are in the [reference](reference.md#top-level-evaluationconfig).
 
-`forecast.anemoi_inference` consumes `members`, `seed`, `quiet`, `forcings_cache_bytes` and
-`member_inputs` (one `input` block per member, see the [reference](reference.md#anemoi_inference-anemoiinferenceconfig-extraallow));
+`forecast.anemoi_inference` consumes `members`, `seed`, `quiet`, `forcings_cache_bytes`,
+`member_inputs` (one `input` block per member) and `rollout_seeds` (anemoi-inference-style seeds), see the
+[reference](reference.md#anemoi_inference-anemoiinferenceconfig-extraallow);
 every other key goes to the anemoi-inference run configuration (`checkpoint`, `device`, `input`, `env`,
 ...), except `date` and a non-`none` `output`, which are refused because init times come from the
 evaluation and forecast fields never leave memory. `targets.anemoi_dataset` consumes `prefetch`
@@ -302,6 +303,24 @@ The global RNG is reseeded before every member's model call with a hash of
 `(seed, init time, member, call)`, so a member depends on neither the ensemble size nor the other
 members: member 2 of a 4-member run is bit-identical to member 2 of an 8-member run with the same
 seed.
+
+To reproduce separate `anemoi-inference run`s instead, one per member with its own `seed:`, give the seeds
+with `rollout_seeds`: member `m` of init time `t` is seeded once with
+`base + init_hours_factor * (hours since 1970-01-01T00 UTC of t) + member_offsets[m]` and keeps its own random
+stream across its model calls, as one inference run does:
+
+```yaml
+forecast:
+  anemoi_inference:
+    members: 5
+    rollout_seeds:            # the seed of member m: 16014075 + 10 * hours(t) + (m + 1)
+      base: 16014075
+      init_hours_factor: 10
+      member_offsets: [1, 2, 3, 4, 5]
+```
+
+The ensemble noise injector draws the full noise tensor on every rank, so the noise does not depend on how
+many GPUs the inference run used.
 
 `crps`, `fair_crps`, `spread`, `spread_skill`, `rank_histogram` and `outlier_fraction` need at
 least two members and raise when the source has fewer. Five choices worth making deliberately:

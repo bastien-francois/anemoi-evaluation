@@ -115,9 +115,20 @@ class InitTimesList(_Model):
 InitTimesConfig = InitTimesRange | InitTimesList
 
 
+class RolloutSeedsConfig(_Model):
+    """anemoi-inference-style seeding: member `m` of init time `t` is seeded once, `torch.manual_seed(base +
+    init_hours_factor * hours(t) + member_offsets[m])` with `hours(t)` the whole hours since 1970-01-01T00 UTC, before
+    its rollout, and keeps its own random stream across its model calls; the seed of a single `anemoi-inference run`
+    with `seed:` set to that value."""
+
+    base: int = 0
+    init_hours_factor: int = 0
+    member_offsets: list[int]
+
+
 class AnemoiInferenceConfig(BaseModel):
-    """The `anemoi_inference` block: `members`, `seed`, `quiet`, `forcings_cache_bytes` and `member_inputs`, the rest
-    goes to the runner configuration."""
+    """The `anemoi_inference` block: `members`, `seed`, `quiet`, `forcings_cache_bytes`, `member_inputs` and
+    `rollout_seeds`, the rest goes to the runner configuration."""
 
     model_config = ConfigDict(extra="allow")
 
@@ -128,11 +139,18 @@ class AnemoiInferenceConfig(BaseModel):
     # one anemoi-inference `input` block per member, `{yyyy}`, `{mm}`, `{dd}`, `{hh}`, `{yyyymmdd}` and `{yyyymmddhh}`
     # filled in from the init time: each member's prognostics are read from its own input
     member_inputs: list[dict] | None = None
+    # instead of `seed`'s per-call hash: one torch.manual_seed per member rollout, as anemoi-inference's `seed:`
+    rollout_seeds: RolloutSeedsConfig | None = None
 
     @model_validator(mode="after")
     def _member_inputs_per_member(self) -> AnemoiInferenceConfig:
         if self.member_inputs is not None and len(self.member_inputs) != self.members:
             raise ValueError(f"member_inputs has {len(self.member_inputs)} input blocks for {self.members} members")
+        if self.rollout_seeds is not None and len(self.rollout_seeds.member_offsets) != self.members:
+            raise ValueError(
+                f"rollout_seeds.member_offsets has {len(self.rollout_seeds.member_offsets)} offsets for "
+                f"{self.members} members"
+            )
         return self
 
 

@@ -48,6 +48,7 @@ def test_init_times_forms_and_inference_block():
         **CONFIG["forecast"]["anemoi_inference"],
         "forcings_cache_bytes": 2**30,
         "member_inputs": None,
+        "rollout_seeds": None,
     }
 
 

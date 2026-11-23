@@ -18,6 +18,11 @@
   at every init time, and each input is opened once per run. Single-dataset checkpoints only.
 * Derived variable `10si = sqrt(10u^2 + 10v^2)`, on the forecast frames and the dataset targets, scored
   only when `variables` names it; not with `--member-group`.
+* `forecast.anemoi_inference.rollout_seeds` (`base`, `init_hours_factor`, `member_offsets`): seeding as
+  anemoi-inference's `seed:`, instead of the per-call hash. Member `m` of init time `t` is seeded once with
+  `base + init_hours_factor * hours since 1970-01-01T00 UTC + member_offsets[m]` and keeps its own random
+  stream across its model calls, so its noise is that of a separate `anemoi-inference run` with that seed.
+  Forecasters only.
 
 * New time bins `bins: {time: hour}`, one per hour of day (`00` to `23`); by valid time they give the
   diurnal cycle.

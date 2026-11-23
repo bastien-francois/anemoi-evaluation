@@ -58,6 +58,36 @@ def create_input_state(source: object, init_time: datetime.datetime, lagged: lis
     return source.create_input_state(date=init_time)
 
 
+def hours_since_epoch(init_time: datetime.datetime) -> int:
+    """Whole hours from 1970-01-01T00 UTC to `init_time` (naive times are UTC), as `date +%s` / 3600 in a shell."""
+    if init_time.tzinfo is not None:
+        init_time = init_time.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+    return int((init_time - datetime.datetime(1970, 1, 1)).total_seconds()) // 3600
+
+
+def rollout_seed(seeds: Mapping, init_time: datetime.datetime, member: int) -> int:
+    """Seed of `member`'s rollout from `init_time` under `rollout_seeds`:
+    `base + init_hours_factor * hours_since_epoch(init_time) + member_offsets[member]`."""
+    return (
+        int(seeds.get("base", 0))
+        + int(seeds.get("init_hours_factor", 0)) * hours_since_epoch(init_time)
+        + int(seeds["member_offsets"][member])
+    )
+
+
+def rng_state(device: torch.device) -> tuple:
+    """The CPU and (on a GPU) the device's default-generator states."""
+    cuda = torch.cuda.get_rng_state(device) if device.type == "cuda" else None
+    return torch.get_rng_state(), cuda
+
+
+def set_rng_state(state: tuple, device: torch.device) -> None:
+    cpu, cuda = state
+    torch.set_rng_state(cpu)
+    if cuda is not None:
+        torch.cuda.set_rng_state(cuda, device)
+
+
 DATE_PLACEHOLDERS = ("yyyy", "mm", "dd", "hh", "yyyymmdd", "yyyymmddhh")
 
 
@@ -544,12 +574,18 @@ class InferenceForecastSource(ForecastSourceBase):
         quiet: bool = True,
         forcings_cache_bytes: int = DEFAULT_FORCINGS_CACHE_BYTES,
         member_inputs: list[Mapping] | None = None,
+        rollout_seeds: Mapping | None = None,
         **run_config: object,
     ) -> None:
         """`member_inputs`: optional list of one anemoi-inference `input` block per member (`members` of them), each
         with `{yyyy}`, `{mm}`, `{dd}`, `{hh}`, `{yyyymmdd}`, `{yyyymmddhh}` filled in from the init time, from which
         that member's prognostic input state is read, e.g. one EDA member each, or inputs that change with the init
-        time. Constant and dynamic forcings still come from the runner's `input`. Single-dataset checkpoints only."""
+        time. Constant and dynamic forcings still come from the runner's `input`. Single-dataset checkpoints only.
+
+        `rollout_seeds`: optional `{base, init_hours_factor, member_offsets}` replacing the per-call `member_seed`
+        reseeding: member `m` of init time `t` is seeded once with `rollout_seed(rollout_seeds, t, m)` before its
+        rollout and keeps its own random stream (CPU and device generator states, saved and restored around each of
+        its steps), as one `anemoi-inference run` with `seed:` set to that value. `seed` is then unused."""
         from anemoi.inference.checkpoint import Checkpoint
         from anemoi.inference.config.run import RunConfiguration
         from anemoi.inference.runners import create_runner
@@ -566,6 +602,17 @@ class InferenceForecastSource(ForecastSourceBase):
         if member_inputs is not None and len(member_inputs) != members:
             raise ValueError(f"member_inputs has {len(member_inputs)} input blocks for {members} members")
         self.member_inputs = None if member_inputs is None else [dict(block) for block in member_inputs]
+        if rollout_seeds is not None:
+            rollout_seeds = dict(rollout_seeds)
+            offsets = list(rollout_seeds.get("member_offsets") or [])
+            if len(offsets) != members:
+                raise ValueError(f"rollout_seeds.member_offsets has {len(offsets)} offsets for {members} members")
+            rollout_seeds = {
+                "base": int(rollout_seeds.get("base", 0)),
+                "init_hours_factor": int(rollout_seeds.get("init_hours_factor", 0)),
+                "member_offsets": [int(o) for o in offsets],
+            }
+        self.rollout_seeds = rollout_seeds
         self.members = members
         self.seed = seed
         self.quiet = quiet
@@ -605,6 +652,8 @@ class InferenceForecastSource(ForecastSourceBase):
         self.input_offsets = list(self.runner.checkpoint.lagged)
         self.output_offsets = list(self.runner.checkpoint.output_offsets)
         if self.task == "temporal-downscaler":
+            if self.rollout_seeds is not None:
+                raise ValueError("rollout_seeds is for forecasters, a temporal downscaler is seeded per window call")
             # one window per init time: its outputs come from one model call, placed by `downscaler_window`
             self.temporal_downscaling = True
             self.window, self.window_leads = downscaler_window(self.runner.checkpoint)
@@ -864,6 +913,14 @@ class InferenceForecastSource(ForecastSourceBase):
         self.runner.reference_date = None
         # The runner enters inference mode inside each generator; interleaved generators exit out of
         # order, so this outer guard is what restores the caller's mode.
+        streams = {}
+        if self.rollout_seeds is not None:
+            rng_device = torch.device(str(self.runner.device))
+            # one torch.manual_seed per member rollout, as anemoi-inference's Runner does once per run; each member
+            # then keeps its own stream: its generator states are restored before and saved after each of its steps
+            for member in members:
+                torch.manual_seed(rollout_seed(self.rollout_seeds, init_time, member))
+                streams[member] = rng_state(rng_device)
         with self._quiet(), torch.inference_mode():
             generators = [
                 self.runner.run(input_states=states, lead_time=lead_time, return_numpy=False)
@@ -877,6 +934,11 @@ class InferenceForecastSource(ForecastSourceBase):
                     call, lead = schedule[step_index] if step_index < len(schedule) else (None, None)
                     new_call = call is not None and (step_index == 0 or schedule[step_index - 1][0] != call)
                     for member, generator in zip(members, generators):
+                        if streams:
+                            set_rng_state(streams[member], rng_device)
+                            outputs.append(next(generator, None))
+                            streams[member] = rng_state(rng_device)
+                            continue
                         if new_call:
                             torch.manual_seed(member_seed(self.seed, init_time, member, call))
                         outputs.append(next(generator, None))
@@ -1205,6 +1267,7 @@ class InferenceForecastSource(ForecastSourceBase):
                 "quiet": self.quiet,
                 "forcings_cache_bytes": self.forcings_cache_bytes,
                 **({"member_inputs": self.member_inputs} if self.member_inputs is not None else {}),
+                **({"rollout_seeds": self.rollout_seeds} if self.rollout_seeds is not None else {}),
             }
         }
 
@@ -1239,7 +1302,7 @@ class InferenceForecastSource(ForecastSourceBase):
             ),
             "output_horizon": frequency_to_string(self.output_horizon),
             "members": self.members,
-            "seed": self.seed,
+            **({"seed": self.seed} if self.rollout_seeds is None else {"rollout_seeds": self.rollout_seeds}),
             "device": str(self.device),
             "model_loaded": self.model_loaded,
             "forcings_cache_bytes": self.forcings_cache_bytes,
