@@ -139,7 +139,7 @@ def member_inputs_source(members: int = 2) -> InferenceForecastSource:
     return source
 
 
-def test_member_inputs_give_each_member_its_own_initial_state_and_10si():
+def test_member_inputs_give_each_member_its_own_initial_state_and_10si(monkeypatch):
     source = member_inputs_source()
     assert source.member_input_config(1, T0 + 12 * HOUR) == {"dataset": "/m2/2024010212.zarr"}
     frames = list(source.frames(T0 + 12 * HOUR, 12 * HOUR, ["2t", "10si"], CPU))
@@ -153,9 +153,19 @@ def test_member_inputs_give_each_member_its_own_initial_state_and_10si():
     lead0 = source.initial_frame(T0, ["2t", "10si"], CPU)
     torch.testing.assert_close(lead0.data[:, 0, 0], torch.tensor([0.0, 1.0]))
     torch.testing.assert_close(lead0.data[:, 1, 0], torch.tensor([5.0, 10.0]))
-    source.member_group = SimpleNamespace()
-    with pytest.raises(ValueError, match="need an unsplit run"):
-        next(source.frames(T0, 6 * HOUR, ["10si"], CPU))
+    # in a member group, 10si is derived from this rank's members before the exchange of blocks of variables
+    import anemoi.evaluation.distributed
+
+    # one rank holding both members (block of 2 members: all) and, after the exchange, variable 3 of 3 (10si)
+    monkeypatch.setattr(anemoi.evaluation.distributed, "swap", lambda data, members: data[:, 2:3])
+    source.member_group = SimpleNamespace(block=lambda n: slice(0, n) if n == 2 else slice(2, 3))
+    split = list(source.frames(T0 + 12 * HOUR, 12 * HOUR, ["2t", "10u", "10si"], CPU))
+    assert [f.variables for f in split] == [["10si"], ["10si"]]
+    for k, frame in enumerate(split, start=1):
+        for m in range(2):
+            expected = float(np.hypot(3.0 * (m + 1) + k, 4.0 * (m + 1) + k))
+            torch.testing.assert_close(frame.data[m, 0], torch.full((N,), expected))
+    assert source._derive_columns is None
 
 
 def test_member_inputs_are_opened_once(monkeypatch):

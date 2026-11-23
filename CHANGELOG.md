@@ -18,7 +18,7 @@
   constant and dynamic forcings still come from `input`. The dates every anemoi-datasets member input needs
   are checked at every init time, and each input is opened once per run. Single-dataset checkpoints only.
 * Derived variable `10si = sqrt(10u^2 + 10v^2)`, on the forecast frames and the dataset targets, scored
-  only when `variables` names it; not with `--member-group`.
+  only when `variables` names it; with `--member-group` it is derived on each rank before the member exchange.
 * `forecast.anemoi_inference.seed_mode: per_rollout`: each member is seeded once before its rollout and keeps
   its own random stream across its model calls, as a separate `anemoi-inference run` with that `seed:`; the
   default `per_call` reseeding is unchanged. The seed comes from `rollout_seed` (`function` named

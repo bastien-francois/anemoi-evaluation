@@ -812,12 +812,18 @@ class InferenceForecastSource(ForecastSourceBase):
         temporal downscaler), copied into a new tensor. In a member group it is every member's frame of this rank's
         variables, and the rank's frame of every variable is freed here, before the frames are scored."""
         frames = {}
+        derive_to = getattr(self, "_derive_columns", None) or {}
         for name, columns in variables.items():
             columns = list(columns)
             data = torch.stack(
                 [torch.stack([torch.as_tensor(output[name]["fields"][v]) for v in columns]) for output in outputs]
             )
             data = data.float().to(device)
+            requested = derive_to.get(name)
+            if requested is not None and list(requested) != columns:
+                # derived variables from this rank's members, before a member group exchanges blocks of variables
+                data = derive(data, columns, list(requested)).float().contiguous()
+                columns = list(requested)
             if self.member_group is not None:
                 from anemoi.evaluation.distributed import swap
 
@@ -895,16 +901,14 @@ class InferenceForecastSource(ForecastSourceBase):
         name = self._resolve_dataset(None)
         requested = list(variables)
         base = base_variables(requested, self.datasets[name].variables)
-        if base != requested and self.member_group is not None:
-            # a member group's frame holds only the rank's block of the variables, not every component
-            raise ValueError(f"derived variables {[v for v in requested if v not in base]} need an unsplit run")
-        for frames in self.multi_frames(init_time, lead_time, {name: base}, device):
-            frame = frames[name]
-            if base == requested:
-                yield frame
-            else:
-                data = derive(frame.data, base, requested).float().contiguous()
-                yield Frame(frame.init_time, frame.lead_time, frame.valid_time, requested, data)
+        # the model's variables are read, the derived ones computed in `_frames` from each rank's members before a
+        # member group exchanges blocks of variables, so that a derived variable's components are always together
+        self._derive_columns = {name: requested} if base != requested else None
+        try:
+            for frames in self.multi_frames(init_time, lead_time, {name: base}, device):
+                yield frames[name]
+        finally:
+            self._derive_columns = None
 
     def multi_frames(
         self,

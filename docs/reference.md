@@ -208,8 +208,8 @@ one. `linear_interpolation` yields `k * timestep` for `0 < k * timestep < lead_t
 
 Derived variables: `10si` (`sqrt(10u^2 + 10v^2)`) is delivered by the inference source of a single-dataset
 checkpoint and by the dataset targets when they hold `10u` and `10v`, listed in their `derived_variables`
-rather than `variables`, so it is scored only when the config's `variables` names it. It is not available
-with `--member-group`.
+rather than `variables`, so it is scored only when the config's `variables` names it. With `--member-group`
+it is computed on each rank from that rank's members, before the ranks exchange blocks of variables.
 
 Every other key goes to `anemoi.inference.config.run.RunConfiguration` (`checkpoint`, `device`, `input`,
 `env`, ...). The block is loaded as `{"verbosity": 0, **block, "output": "none"}`: `verbosity: 0` is only
