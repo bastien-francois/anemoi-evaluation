@@ -14,6 +14,7 @@ from anemoi.utils.humanize import compress_dates
 
 from anemoi.evaluation.aggregation import AggregationState
 from anemoi.evaluation.metrics import Metric
+from anemoi.evaluation.target_qc import merge_attrs as merge_target_qc
 
 LOG = logging.getLogger(__name__)
 BIN_ALL = "all"
@@ -105,9 +106,28 @@ def load_state(path: str | Path) -> AggregationState:
     )
 
 
+def merge_forecast_minimum(values: list[str]) -> str:
+    """Merge `forecast_minimum` attributes of runs with disjoint init times: counts summed per variable and lead
+    time (every scored frame belongs to one run), the smallest value kept."""
+    parsed = [json.loads(value) for value in values]
+    if any(p["minimum"] != parsed[0]["minimum"] for p in parsed[1:]):
+        raise ValueError("forecast_minimum: the runs to merge have different minimums")
+    raised: dict[str, dict[str, dict]] = {}
+    for p in parsed:
+        for name, leads in p["raised"].items():
+            for lead, entry in leads.items():
+                total = raised.setdefault(name, {}).setdefault(lead, {"raised": 0, "smallest": None})
+                total["raised"] += entry["raised"]
+                if entry["smallest"] is not None:
+                    smallest = total["smallest"]
+                    total["smallest"] = entry["smallest"] if smallest is None else min(smallest, entry["smallest"])
+    return json.dumps({"minimum": parsed[0]["minimum"], "raised": raised})
+
+
 def merge(items: Iterable[AggregationState | str | Path], *, partial: bool = False) -> AggregationState:
     """Sum states or result files with disjoint init times, whose `shard` tags must be the complete `0..n-1` of one
     run unless `partial`; attrs come from the first except the timing totals and the counters (summed),
+    `target_qc` (counts united by valid time), `forecast_minimum` (counts summed per lead, smallest kept),
     `peak_gpu_memory_bytes` (the maximum), `init_times` (the union), `config` (a JSON `{"merge": [...]}` of every
     input's config) and `shard` (dropped, or the shards merged when `partial` allowed an incomplete set)."""
     items = list(items)
@@ -127,6 +147,12 @@ def merge(items: Iterable[AggregationState | str | Path], *, partial: bool = Fal
             values = [state.attrs[key] for state in states if key in state.attrs]
             if values:
                 attrs[key] = cast(combine(values))
+    qc = [state.attrs["target_qc"] for state in states if "target_qc" in state.attrs]
+    if qc:
+        attrs["target_qc"] = merge_target_qc(qc)
+    minimum = [state.attrs["forecast_minimum"] for state in states if "forecast_minimum" in state.attrs]
+    if minimum:
+        attrs["forecast_minimum"] = merge_forecast_minimum(minimum)
     attrs["init_times"] = ", ".join(compress_dates(result.init_times)) if result.init_times else ""
     attrs["config"] = json.dumps({"merge": [state.attrs.get("config") for state in states]})
     paths = [str(item) for item in items if isinstance(item, (str, Path))]

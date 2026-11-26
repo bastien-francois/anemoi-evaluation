@@ -137,3 +137,28 @@ def test_only_grid():
     assert targets.qc.counts() == [{"rule": "only_grid", "variable": "c", "removed": 4, "valid_times": 1}]
     whole = DatasetTargets.from_dataset(FakeDataset(grids=(10,)), qc=[{"only_grid": {"variables": ["c"]}}])
     assert not np.isnan(whole.frame(T0, ["c"], CPU).numpy()).any()  # a single grid: nothing to remove
+
+
+def test_attr_and_merge_across_shards(qc_dataset):
+    from anemoi.evaluation.target_qc import merge_attrs
+
+    first, second = _targets(), _targets()  # two shards; both read T0 + 6 h (an overlapping valid time)
+    for date in (T0, T0 + 6 * HOUR):
+        first.frame(date, ["a", "b"], CPU)
+    for date in (T0 + 6 * HOUR, T0 + 12 * HOUR):
+        second.frame(date, ["a", "b"], CPU)
+    attr = json.loads(first.qc.attr())
+    assert attr["removed"] == first.qc.counts() and attr["rules"] == first.qc.specs
+    merged = json.loads(merge_attrs([first.qc.attr(), second.qc.attr()]))
+    totals = {(c["rule"], c["variable"]): (c["removed"], c["valid_times"]) for c in merged["removed"]}
+    assert totals[("max_distance", "a")] == (15, 3)  # 5 per valid time, T0 + 6 h counted once
+    assert totals[("drop_where", "b")] == (1, 3) and totals[("drop_dates", "b")] == (6, 3)
+    single = _targets()
+    for date in (T0, T0 + 6 * HOUR, T0 + 12 * HOUR):
+        single.frame(date, ["a", "b"], CPU)
+    assert merged["removed"] == single.qc.counts()  # = one run over the three valid times
+    other = DatasetTargets.from_dataset(FakeDataset(), qc=[{"only_grid": {"variables": ["c"], "grid": 1}}])
+    with pytest.raises(ValueError, match="different qc rules"):
+        merge_attrs([first.qc.attr(), other.qc.attr()])
+    legacy = json.dumps({"rules": first.qc.specs, "removed": first.qc.counts()})  # written before by_valid_time
+    assert merge_attrs([legacy, second.qc.attr()]) == legacy

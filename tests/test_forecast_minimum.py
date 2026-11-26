@@ -71,3 +71,17 @@ def test_unknown_variable_ignored_and_config(fake_sources, caplog):
     config = {"forecast": {"persistence": {"timestep": "6h"}}, "lead_time": "24h", "init_times": {"dates": ["2024-01-01"]}}
     assert EvaluationConfig.model_validate(config).forecast_minimum is None
     assert EvaluationConfig.model_validate({**config, "forecast_minimum": {"tp": 0}}).forecast_minimum == {"tp": 0.0}
+
+
+def test_merge_shards(fake_sources):
+    from anemoi.evaluation.output import merge
+    from anemoi.evaluation.output import merge_forecast_minimum
+
+    forecast, targets = fake_sources(members=3, drift=-0.5, spread=0.2)
+    whole = _evaluation(forecast, targets, forecast_minimum={"q": 0.0})
+    expected = json.loads(whole.run().attrs["forecast_minimum"])
+    shards = [_evaluation(forecast, targets, forecast_minimum={"q": 0.0}) for _ in INITS]
+    states = [evaluation.run([init]) for evaluation, init in zip(shards, INITS)]
+    assert json.loads(merge(states).attrs["forecast_minimum"]) == expected
+    with pytest.raises(ValueError, match="different minimums"):
+        merge_forecast_minimum([json.dumps({"minimum": {"q": 0.0}, "raised": {}}), json.dumps({"minimum": {"q": 1.0}, "raised": {}})])

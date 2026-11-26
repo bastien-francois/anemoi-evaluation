@@ -15,12 +15,16 @@ the `anemoi_dataset` targets block, each for the `variables` it names (`grid`: a
   have is an error; NaN in the QC field drops nothing.
 - `drop_dates: {variables, grid, start, end}`: every node of sub-grid `grid` is set to NaN for valid times in [start, end].
 
-`counts()` gives, per rule and variable, the finite target values each rule removed over the distinct valid times read.
+`counts()` gives, per rule and variable, the finite target values each rule removed over the distinct valid times read;
+`attr()` is the `target_qc` result attribute (rules, totals and counts per valid time), `merge_attrs()` merges the
+attributes of runs (shards) whose valid times may overlap: each valid time is counted once.
 """
 
 from __future__ import annotations
 
 import datetime
+import json
+import logging
 from typing import Any
 
 import numpy as np
@@ -180,3 +184,40 @@ class TargetQC:
                 seen = [n for (r, v, _), n in self._counts.items() if r == k and v == name]
                 out.append({"rule": next(iter(spec)), "variable": name, "removed": sum(seen), "valid_times": len(seen)})
         return out
+
+    def by_valid_time(self) -> list[dict]:
+        """Per rule and variable: finite target values removed at each valid time read (ISO time -> count)."""
+        out = []
+        for k, spec in enumerate(self.specs):
+            for name in self.rules[k].variables:
+                seen = {t: n for (r, v, t), n in self._counts.items() if r == k and v == name}
+                out.append({"rule": next(iter(spec)), "variable": name,
+                            "removed": {t.isoformat(): n for t, n in sorted(seen.items())}})
+        return out
+
+    def attr(self) -> str:
+        """The `target_qc` result attribute: JSON of the rules, the totals and the counts per valid time."""
+        return json.dumps({"rules": self.specs, "removed": self.counts(), "by_valid_time": self.by_valid_time()}, default=str)
+
+
+def merge_attrs(values: list[str]) -> str:
+    """Merge `target_qc` attributes of runs with the same rules: the counts per valid time are united (a valid time
+    read by several runs counts once and must have the same count in each) and the totals recomputed."""
+    parsed = [json.loads(value) for value in values]
+    if any("by_valid_time" not in p for p in parsed):  # results written before the counts per valid time
+        logging.getLogger(__name__).warning("target_qc: inputs without counts per valid time, the first input's kept")
+        return values[0]
+    first = parsed[0]
+    if any(json.dumps(p["rules"], sort_keys=True) != json.dumps(first["rules"], sort_keys=True) for p in parsed[1:]):
+        raise ValueError("target_qc: the runs to merge have different qc rules")
+    merged = []
+    for i, entry in enumerate(first["by_valid_time"]):
+        union: dict[str, int] = {}
+        for p in parsed:
+            for time, n in p["by_valid_time"][i]["removed"].items():
+                if union.setdefault(time, n) != n:
+                    raise ValueError(f"target_qc {entry['rule']} {entry['variable']}: {time} removed {union[time]} vs {n}")
+        merged.append({"rule": entry["rule"], "variable": entry["variable"], "removed": dict(sorted(union.items()))})
+    totals = [{"rule": m["rule"], "variable": m["variable"], "removed": sum(m["removed"].values()),
+               "valid_times": len(m["removed"])} for m in merged]
+    return json.dumps({"rules": first["rules"], "removed": totals, "by_valid_time": merged}, default=str)

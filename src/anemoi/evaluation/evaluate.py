@@ -702,7 +702,7 @@ class Evaluation:
             )
         qc = getattr(self.targets, "qc", None)
         if qc is not None:
-            attrs["target_qc"] = json.dumps({"rules": qc.specs, "removed": qc.counts()}, default=str)
+            attrs["target_qc"] = qc.attr()
         for key, value in getattr(self.forecast, "stats", {}).items():
             attrs[key] = int(value)
         return attrs
@@ -1078,7 +1078,9 @@ def build(
 def _targets_from_config(block: object, forecast: ForecastSource | None) -> TargetSource:
     """The configured target source; without an `anemoi_dataset` mapping, the forecast source's own dataset."""
     options = block.anemoi_dataset if block is not None else AnemoiDatasetConfig()
-    settings = {"prefetch": options.prefetch, "cache_bytes": options.cache_bytes, "qc": options.qc}
+    settings = {"prefetch": options.prefetch, "cache_bytes": options.cache_bytes}
+    if options.qc:  # only when set: a run without qc calls the sources exactly as before
+        settings["qc"] = options.qc
     kwargs = options.open_dataset_kwargs()
     if kwargs:
         return DatasetTargets(**kwargs, **settings)
