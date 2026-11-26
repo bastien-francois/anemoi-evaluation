@@ -14,6 +14,8 @@ the `anemoi_dataset` targets block, each for the `variables` it names (`grid`: a
   compared in the field's own dtype) the targets are set to NaN at that valid time. A valid time the QC dataset does not
   have is an error; NaN in the QC field drops nothing.
 - `drop_dates: {variables, grid, start, end}`: every node of sub-grid `grid` is set to NaN for valid times in [start, end].
+- `valid_range: {variables, min, max}`: values below `min` or above `max` (either may be left out) are set to NaN, e.g.
+  the plausibility checks of station observations.
 
 `counts()` gives, per rule and variable, the finite target values each rule removed over the distinct valid times read;
 `attr()` is the `target_qc` result attribute (rules, totals and counts per valid time), `merge_attrs()` merges the
@@ -67,8 +69,9 @@ class _Rule:
     def __init__(self, options: dict, targets: Any) -> None:
         self.variables = list(options["variables"])
 
-    def drop(self, valid_time: datetime.datetime) -> np.ndarray | None:
-        """(N,) boolean, True where the target is set to NaN at `valid_time`; None when nothing is dropped."""
+    def drop(self, valid_time: datetime.datetime, values: np.ndarray) -> np.ndarray | None:
+        """(N,) boolean, True where the target `values` (one variable at `valid_time`) are set to NaN; None when
+        nothing is dropped."""
         raise NotImplementedError
 
 
@@ -84,7 +87,7 @@ class MaxDistance(_Rule):
         far = distance_to_nearest_km(lat, lon, sites) > float(options["max_km"])
         self._drop = _on_target_nodes(far, start, int(targets.ds.shape[-1]), False, targets)
 
-    def drop(self, valid_time: datetime.datetime) -> np.ndarray:
+    def drop(self, valid_time: datetime.datetime, values: np.ndarray) -> np.ndarray:
         return self._drop
 
 
@@ -105,16 +108,19 @@ class DropWhere(_Rule):
         self.above = options["above"]
         self.index = {date: i for i, date in enumerate(self.qc.dates.astype("datetime64[us]").tolist())}
         self.total, self.targets = int(targets.ds.shape[-1]), targets
+        self._last: tuple | None = None
 
-    def drop(self, valid_time: datetime.datetime) -> np.ndarray | None:
+    def drop(self, valid_time: datetime.datetime, values: np.ndarray) -> np.ndarray | None:
+        if self._last is not None and self._last[0] == valid_time:  # several variables at one valid time: read once
+            return self._last[1]
         i = self.index.get(valid_time)
         if i is None:
             raise ValueError(f"qc drop_where: the QC dataset has no valid time {valid_time}")
         field = np.asarray(self.qc[i][self.column, 0])
         bad = field > field.dtype.type(self.above)  # NaN compares False: drops nothing
-        if not bad.any():
-            return None
-        return _on_target_nodes(bad, self.start, self.total, False, self.targets)
+        drop = _on_target_nodes(bad, self.start, self.total, False, self.targets) if bad.any() else None
+        self._last = (valid_time, drop)
+        return drop
 
 
 class DropDates(_Rule):
@@ -126,7 +132,7 @@ class DropDates(_Rule):
         start, size = _sub_grid(targets, int(options.get("grid", 0)))
         self._all = _on_target_nodes(np.ones(size, dtype=bool), start, int(targets.ds.shape[-1]), False, targets)
 
-    def drop(self, valid_time: datetime.datetime) -> np.ndarray | None:
+    def drop(self, valid_time: datetime.datetime, values: np.ndarray) -> np.ndarray | None:
         return self._all if self.start <= valid_time <= self.end else None
 
 
@@ -139,11 +145,27 @@ class OnlyGrid(_Rule):
         start, size = _sub_grid(targets, int(options.get("grid", 0)))
         self._drop = _on_target_nodes(np.zeros(size, dtype=bool), start, int(targets.ds.shape[-1]), True, targets)
 
-    def drop(self, valid_time: datetime.datetime) -> np.ndarray | None:
+    def drop(self, valid_time: datetime.datetime, values: np.ndarray) -> np.ndarray | None:
         return self._drop if self._drop.any() else None
 
 
-RULES = {"only_grid": OnlyGrid, "max_distance": MaxDistance, "drop_where": DropWhere, "drop_dates": DropDates}
+class ValidRange(_Rule):
+    def __init__(self, options: dict, targets: Any) -> None:
+        super().__init__(options, targets)
+        self.low, self.high = options.get("min"), options.get("max")
+        if self.low is None and self.high is None:
+            raise ValueError("qc valid_range: give `min`, `max` or both")
+
+    def drop(self, valid_time: datetime.datetime, values: np.ndarray) -> np.ndarray | None:
+        outside = np.zeros(values.shape, dtype=bool)
+        if self.low is not None:
+            outside |= values < self.low
+        if self.high is not None:
+            outside |= values > self.high
+        return outside if outside.any() else None  # NaN compares False: left as it is
+
+
+RULES = {"only_grid": OnlyGrid, "max_distance": MaxDistance, "drop_where": DropWhere, "drop_dates": DropDates, "valid_range": ValidRange}
 
 
 class TargetQC:
@@ -168,8 +190,8 @@ class TargetQC:
             rows = [i for i, name in enumerate(variables) if name in rule.variables]
             if not rows:
                 continue
-            drop = rule.drop(valid_time)
             for i in rows:
+                drop = rule.drop(valid_time, data[i])
                 removed = 0 if drop is None else int((drop & np.isfinite(data[i])).sum())
                 self._counts[(k, variables[i], valid_time)] = removed
                 if drop is not None:

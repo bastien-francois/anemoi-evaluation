@@ -207,10 +207,22 @@ class AnemoiDatasetConfig(BaseModel):
         return dict(self.model_extra or {})
 
 
+class ObstableConfig(_Model):
+    """The `obstable` targets block: station observations from a harp obstable sqlite (`path`, `table`, `variables`,
+    `qc` rules on the observations, e.g. `valid_range`); needs the `interpolation` block, see
+    `anemoi.evaluation.stations`."""
+
+    path: str
+    table: str = "SYNOP"
+    variables: list[str] | None = None
+    qc: list[dict[str, dict[str, Any]]] | None = None
+
+
 class TargetsConfig(_Model):
     """Target source, exactly one key."""
 
     anemoi_dataset: AnemoiDatasetConfig | None = None
+    obstable: ObstableConfig | None = None
 
     @model_validator(mode="after")
     def _one_source(self) -> TargetsConfig:
@@ -395,6 +407,33 @@ class OutputConfig(_Model):
     path: str
 
 
+class BilinearCellConfig(_Model):
+    """The forecast's structured grid: `shape` (rows, columns, row-major) of the nodes from `first_node` on."""
+
+    shape: tuple[int, int]
+    first_node: int = Field(0, ge=0)
+
+
+class InterpolationConfig(_Model):
+    """How the forecast is seen at the stations of an `obstable` target, exactly one key."""
+
+    bilinear_cell: BilinearCellConfig
+
+
+class HeightCorrectionConfig(_Model):
+    """`x + lapse_rate * (orography@station - station elevation)`; `orography`: {dataset, variable} (m)."""
+
+    lapse_rate: float
+    orography: dict[str, Any]
+
+    @field_validator("orography")
+    @classmethod
+    def _check_orography(cls, value: dict) -> dict:
+        if set(value) != {"dataset", "variable"}:
+            raise ValueError(f"orography needs `dataset` and `variable`, got {sorted(value)}")
+        return value
+
+
 class EvaluationConfig(_Model):
     """Everything `anemoi-evaluation run` needs; see `Evaluation.from_config`."""
 
@@ -413,7 +452,18 @@ class EvaluationConfig(_Model):
     on_missing_target: Literal["skip", "raise"] = "skip"
     include_lead_zero: bool = False
     forecast_minimum: dict[str, float] | None = None
+    interpolation: InterpolationConfig | None = None
+    height_correction: dict[str, HeightCorrectionConfig] | None = None
     log_level: str = "INFO"
+
+    @model_validator(mode="after")
+    def _stations(self) -> EvaluationConfig:
+        stations = isinstance(self.targets, TargetsConfig) and self.targets.obstable is not None
+        if stations != (self.interpolation is not None):
+            raise ValueError("`obstable` targets and the `interpolation` block go together (station scores)")
+        if self.height_correction and self.interpolation is None:
+            raise ValueError("`height_correction` needs the `interpolation` block")
+        return self
 
     @field_validator("datasets")
     @classmethod

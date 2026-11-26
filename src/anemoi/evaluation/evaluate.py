@@ -38,6 +38,8 @@ from anemoi.evaluation.config import build_region
 from anemoi.evaluation.config import build_weights
 from anemoi.evaluation.config import config_dataset_names
 from anemoi.evaluation.config import load_config
+from anemoi.evaluation.stations import ObstableTargets
+from anemoi.evaluation.stations import StationForecast
 from anemoi.evaluation.config import per_dataset
 from anemoi.evaluation.frame import Frame
 from anemoi.evaluation.metrics import Metric
@@ -741,6 +743,7 @@ class Evaluation:
                 "on_missing_target": self.on_missing_target,
                 "include_lead_zero": self.include_lead_zero,
                 "forecast_minimum": dict(self.forecast_minimum) or None,
+                **(self.forecast.station_config() if isinstance(self.forecast, StationForecast) else {}),
                 "climatology": self.climatology.to_config() if self.climatology is not None else None,
             }
         )
@@ -1033,15 +1036,22 @@ def build(
         or (ArrayClimatology.from_netcdf(blocks["climatology"][name].file) if blocks["climatology"][name] else None)
         for name in names
     }
+    if config.interpolation is not None and len(names) != 1:
+        raise ValueError(f"station scores (interpolation) need a run that scores one dataset, got {names}")
     evaluations = {}
     for name in names:
+        view = views[name]
+        if config.interpolation is not None:  # the forecast seen at the stations kept by the interpolation
+            cell = config.interpolation.bilinear_cell
+            corrections = {key: value.model_dump() for key, value in (config.height_correction or {}).items()}
+            view = StationForecast(view, sources[name], cell.shape, cell.first_node, corrections)
         regions = {
             region: spec if isinstance(spec, str) else spec.spec() for region, spec in blocks["regions"][name].items()
         }
         weights = blocks["weights"][name]
         try:
             evaluations[name] = Evaluation(
-                views[name],
+                view,
                 sources[name],
                 config.init_times.resolve(),
                 config.lead_time,
@@ -1077,7 +1087,9 @@ def build(
 
 def _targets_from_config(block: object, forecast: ForecastSource | None) -> TargetSource:
     """The configured target source; without an `anemoi_dataset` mapping, the forecast source's own dataset."""
-    options = block.anemoi_dataset if block is not None else AnemoiDatasetConfig()
+    if block is not None and block.obstable is not None:
+        return ObstableTargets(**block.obstable.model_dump())
+    options = block.anemoi_dataset if block is not None and block.anemoi_dataset is not None else AnemoiDatasetConfig()
     settings = {"prefetch": options.prefetch, "cache_bytes": options.cache_bytes}
     if options.qc:  # only when set: a run without qc calls the sources exactly as before
         settings["qc"] = options.qc

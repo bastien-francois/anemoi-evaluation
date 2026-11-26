@@ -162,3 +162,15 @@ def test_attr_and_merge_across_shards(qc_dataset):
         merge_attrs([first.qc.attr(), other.qc.attr()])
     legacy = json.dumps({"rules": first.qc.specs, "removed": first.qc.counts()})  # written before by_valid_time
     assert merge_attrs([legacy, second.qc.attr()]) == legacy
+
+
+def test_valid_range():
+    targets = DatasetTargets.from_dataset(
+        FakeDataset(), qc=[{"valid_range": {"variables": ["a"], "min": 3.0, "max": 7.0}}, {"valid_range": {"variables": ["b"], "max": 15.0}}]
+    )
+    frame = targets.frame(T0, ["a", "b"], CPU)[0].numpy()  # a = 0..9, b = 10..19 at T0
+    assert np.isnan(frame[0]).tolist() == [True] * 3 + [False] * 5 + [True] * 2
+    assert np.isnan(frame[1]).tolist() == [False] * 6 + [True] * 4
+    assert [c["removed"] for c in targets.qc.counts()] == [5, 4]
+    with pytest.raises(ValueError, match="min"):
+        DatasetTargets.from_dataset(FakeDataset(), qc=[{"valid_range": {"variables": ["a"]}}])
