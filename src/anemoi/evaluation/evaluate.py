@@ -40,6 +40,7 @@ from anemoi.evaluation.config import config_dataset_names
 from anemoi.evaluation.config import load_config
 from anemoi.evaluation.stations import ObstableTargets
 from anemoi.evaluation.stations import StationForecast
+from anemoi.evaluation.truths import SharedRollout
 from anemoi.evaluation.config import per_dataset
 from anemoi.evaluation.frame import Frame
 from anemoi.evaluation.metrics import Metric
@@ -757,9 +758,15 @@ class MultiEvaluation:
     only share the model call, the init times and the lead times. `run()` returns one aggregation state per dataset.
     """
 
-    def __init__(self, evaluations: dict[str, Evaluation], forecast: InferenceForecastSource | None = None) -> None:
+    def __init__(
+        self, evaluations: dict[str, Evaluation], forecast: InferenceForecastSource | None = None, kind: str = "dataset"
+    ) -> None:
+        """`kind` "truth": the evaluations are the truths of one dataset (`truths:`), each with its own lead 0."""
+        if kind not in ("dataset", "truth"):
+            raise ValueError(f"kind must be 'dataset' or 'truth', got {kind!r}")
         if not evaluations:
-            raise ValueError("a multi-dataset evaluation needs at least one dataset")
+            raise ValueError(f"a multi-{kind} evaluation needs at least one {kind}")
+        self.kind = kind
         self.evaluations = dict(evaluations)
         self.forecast = forecast
         first = next(iter(self.evaluations.values()))
@@ -769,8 +776,11 @@ class MultiEvaluation:
         self.include_lead_zero = first.include_lead_zero
         self.device = first.device
         for name, evaluation in self.evaluations.items():
-            if evaluation.init_times != self.init_times or evaluation.lead_times != self.lead_times:
-                raise ValueError(f"dataset {name!r} does not share the init times and lead times of the others")
+            leads, own = first.lead_times, evaluation.lead_times
+            if kind == "truth":  # a truth may leave lead 0 out
+                leads, own = [lead for lead in leads if lead], [lead for lead in own if lead]
+            if evaluation.init_times != self.init_times or own != leads:
+                raise ValueError(f"{kind} {name!r} does not share the init times and lead times of the others")
         self.timing: dict[str, float] = {}
         self.model_calls = 0
         self.peak_memory_bytes: int | None = None
@@ -800,6 +810,8 @@ class MultiEvaluation:
         the rollout is split once, and every dataset scores its own block of its variables."""
         if self.forecast is None:
             raise ValueError("only an anemoi_inference forecast can split its members over ranks")
+        if self.kind == "truth":
+            raise ValueError("member groups are not supported with `truths`")
         for evaluation in self.evaluations.values():
             evaluation.split_members(group)
 
@@ -834,7 +846,7 @@ class MultiEvaluation:
             states = self._run_shared(init_times)  # sets self.timing, whose model phase is shared
             self._sum_timing(shared=("model", "total"))
         for name, state in states.items():
-            state.attrs["dataset"] = name
+            state.attrs[self.kind] = name
         self.model_calls = next(iter(self.evaluations.values())).model_calls
         return states
 
@@ -930,7 +942,7 @@ class MultiEvaluation:
         """The YAML-ready config of the run."""
         if self._config is not None:
             return self._config.model_dump(mode="json", exclude_none=True)
-        raise ValueError("a multi-dataset evaluation built by hand cannot be written to a config")
+        raise ValueError(f"a multi-{self.kind} evaluation built by hand cannot be written to a config")
 
     def close(self) -> None:
         """Release every dataset's sources and the shared runner."""
@@ -1002,6 +1014,10 @@ def build(
     config = load_config(config)
     if forecast is None and config.forecast.anemoi_inference is not None:
         forecast = InferenceForecastSource(**config.forecast.anemoi_inference.model_dump())
+    if config.truths is not None:
+        if targets is not None or climatology is not None:
+            raise ValueError("with `truths`, the targets come from each truth's block; none can be given")
+        return _build_truths(config, forecast)
     available = _dataset_names(config, forecast, targets)
     names = _selected_datasets(config, available)
     skipped = [name for name in available if name not in names]
@@ -1081,6 +1097,50 @@ def build(
             view.solo = True
         return evaluations[names[0]]
     evaluation = MultiEvaluation(evaluations, shared)
+    evaluation._config = config
+    return evaluation
+
+
+def _build_truths(config: EvaluationConfig, forecast: ForecastSource | None) -> MultiEvaluation:
+    """One `Evaluation` per truth over one shared rollout (`truths:`); single-dataset runs only."""
+    if forecast is None:
+        raise ValueError("`truths` needs a forecast source")
+    if isinstance(forecast, InferenceForecastSource) and forecast.multi_dataset:
+        if len(forecast.dataset_names) != 1:
+            raise ValueError(f"`truths` needs a checkpoint with one dataset, got {forecast.dataset_names}")
+        forecast = forecast.datasets[forecast.dataset_names[0]]
+    if isinstance(forecast, DatasetForecast):
+        forecast.solo = True
+    evaluations, views = {}, {}
+    for name, truth in config.truths.items():
+        targets = _targets_from_config(truth.targets, forecast)
+        view = forecast
+        if truth.interpolation is not None:
+            cell = truth.interpolation.bilinear_cell
+            corrections = {key: value.model_dump() for key, value in (truth.height_correction or {}).items()}
+            view = StationForecast(forecast, targets, cell.shape, cell.first_node, corrections)
+        regions = truth.regions if truth.regions is not None else config.regions
+        weights = truth.weights if truth.weights is not None else config.weights
+        try:
+            evaluations[name] = Evaluation(
+                view,
+                targets,
+                config.init_times.resolve(),
+                config.lead_time,
+                config.metrics,
+                truth.variables,
+                weights.spec() if weights is not None else None,
+                {region: spec if isinstance(spec, str) else spec.spec() for region, spec in regions.items()},
+                config.bins.model_dump(),
+                on_missing_target=config.on_missing_target,
+                include_lead_zero=config.include_lead_zero if truth.include_lead_zero is None else truth.include_lead_zero,
+                forecast_minimum=truth.forecast_minimum if truth.forecast_minimum is not None else config.forecast_minimum,
+            )
+        except ValueError as error:
+            raise ValueError(f"truth {name!r}: {error}") from error
+        evaluations[name]._config = config
+        views[name] = view
+    evaluation = MultiEvaluation(evaluations, SharedRollout(forecast, views), kind="truth")
     evaluation._config = config
     return evaluation
 

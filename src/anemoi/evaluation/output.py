@@ -169,11 +169,11 @@ def _check_one_dataset(states: list[AggregationState], labels: list[str]) -> Non
     one dataset are merged on their own. Results of a single-dataset run carry no `dataset` attr and merge as before.
     """
     found: dict[str, list[str]] = {}
-    for state, label in zip(states, labels):
-        found.setdefault(str(state.attrs.get("dataset", "")), []).append(label)
+    for state, label in zip(states, labels):  # a `truths:` run labels its files `truth` the same way
+        found.setdefault(str(state.attrs.get("dataset", "")) + "|" + str(state.attrs.get("truth", "")), []).append(label)
     if len(found) > 1:
-        listed = ", ".join(f"{name or '(none)'} ({', '.join(names)})" for name, names in sorted(found.items()))
-        raise ValueError(f"the inputs are results of different datasets: {listed}; merge one dataset at a time")
+        listed = ", ".join(f"{name.strip('|') or '(none)'} ({', '.join(names)})" for name, names in sorted(found.items()))
+        raise ValueError(f"the inputs are results of different datasets or truths: {listed}; merge one at a time")
 
 
 def _shard_tag(value: str, label: str) -> tuple[frozenset[int], int]:

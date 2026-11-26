@@ -434,6 +434,28 @@ class HeightCorrectionConfig(_Model):
         return value
 
 
+class TruthConfig(_Model):
+    """One truth of a `truths:` run: its targets, variables and how they are scored; `regions`, `weights`,
+    `include_lead_zero` and `forecast_minimum` default to the run's top-level values."""
+
+    targets: TargetsConfig
+    variables: list[str]
+    regions: RegionsConfig | None = None
+    weights: WeightsConfig | None = None
+    include_lead_zero: bool | None = None
+    forecast_minimum: dict[str, float] | None = None
+    interpolation: InterpolationConfig | None = None
+    height_correction: dict[str, HeightCorrectionConfig] | None = None
+
+    @model_validator(mode="after")
+    def _stations(self) -> TruthConfig:
+        if (self.targets.obstable is not None) != (self.interpolation is not None):
+            raise ValueError("`obstable` targets and the `interpolation` block go together (station scores)")
+        if self.height_correction and self.interpolation is None:
+            raise ValueError("`height_correction` needs the `interpolation` block")
+        return self
+
+
 class EvaluationConfig(_Model):
     """Everything `anemoi-evaluation run` needs; see `Evaluation.from_config`."""
 
@@ -454,10 +476,22 @@ class EvaluationConfig(_Model):
     forecast_minimum: dict[str, float] | None = None
     interpolation: InterpolationConfig | None = None
     height_correction: dict[str, HeightCorrectionConfig] | None = None
+    # several truths scored from one rollout (one result file per truth, output.path with {truth})
+    truths: dict[str, TruthConfig] | None = None
     log_level: str = "INFO"
 
     @model_validator(mode="after")
     def _stations(self) -> EvaluationConfig:
+        if self.truths is not None:
+            if not self.truths:
+                raise ValueError("truths: name at least one truth, or leave the block out")
+            given = [key for key in ("targets", "variables", "interpolation", "height_correction", "climatology", "datasets")
+                     if getattr(self, key) is not None]
+            if given:
+                raise ValueError(f"with `truths`, {given} belong to each truth (or are not supported), not to the run")
+            if self.output is not None and "{truth}" not in self.output.path:
+                raise ValueError("with `truths`, output.path needs a {truth} placeholder (one file per truth)")
+            return self
         stations = isinstance(self.targets, TargetsConfig) and self.targets.obstable is not None
         if stations != (self.interpolation is not None):
             raise ValueError("`obstable` targets and the `interpolation` block go together (station scores)")

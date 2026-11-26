@@ -44,8 +44,8 @@ def resolve_shard(
     return index, count
 
 
-def format_output_path(path: str, index: int, count: int, dataset: str | None = None) -> str:
-    """`path` with ``{shard}``, ``{shards}`` and ``{dataset}`` filled in.
+def format_output_path(path: str, index: int, count: int, dataset: str | None = None, kind: str = "dataset") -> str:
+    """`path` with ``{shard}``, ``{shards}`` and ``{dataset}`` (or ``{truth}`` for a `truths:` run, `kind`) filled in.
 
     ``{shard}`` is required for several shards. A multi-dataset run writes one file per dataset and therefore needs
     ``{dataset}``; a run over a single dataset must not use it, because the dataset name is then an internal label
@@ -56,9 +56,9 @@ def format_output_path(path: str, index: int, count: int, dataset: str | None = 
         if "{dataset}" in path:
             raise ValueError(f"output.path has a {{dataset}} placeholder but the run scores one dataset, got {path!r}")
         return path.format(shard=index, shards=count)
-    if "{dataset}" not in path:
-        raise ValueError(f"output.path needs a {{dataset}} placeholder to write one file per dataset, got {path!r}")
-    return path.format(shard=index, shards=count, dataset=dataset)
+    if "{" + kind + "}" not in path:
+        raise ValueError(f"output.path needs a {{{kind}}} placeholder to write one file per {kind}, got {path!r}")
+    return path.format(shard=index, shards=count, **{kind: dataset})
 
 
 def _humanise(value: object, key: str = "", in_bytes: bool = False) -> object:
@@ -155,7 +155,10 @@ def _run(args: argparse.Namespace) -> None:
             raise SystemExit(f"--member-group: {error}") from None
     datasets = getattr(evaluation, "dataset_names", None)  # None for a single-dataset run
     paths = (
-        {name: format_output_path(config.output.path, index, count, name) for name in datasets or [None]}
+        {
+            name: format_output_path(config.output.path, index, count, name, getattr(evaluation, "kind", "dataset"))
+            for name in datasets or [None]
+        }
         if config.output is not None
         else {}
     )
