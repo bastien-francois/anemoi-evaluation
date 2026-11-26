@@ -187,13 +187,15 @@ class ForecastConfig(_Model):
 
 class AnemoiDatasetConfig(BaseModel):
     """The `anemoi_dataset` block: `prefetch` (rows read ahead; null means 2 or the forecast's frames per model call,
-    whichever is larger) and `cache_bytes` (host cache, `2GiB` style strings accepted) are consumed by the source, the
-    rest goes to `open_dataset`; nothing else means the forecast's dataset."""
+    whichever is larger), `cache_bytes` (host cache, `2GiB` style strings accepted) and `qc` (target quality-control
+    rules, see `anemoi.evaluation.target_qc`) are consumed by the source, the rest goes to `open_dataset`; nothing else
+    means the forecast's dataset."""
 
     model_config = ConfigDict(extra="allow")
 
     prefetch: int | None = Field(None, ge=0)
     cache_bytes: int = Field(0, ge=0)
+    qc: list[dict[str, dict[str, Any]]] | None = None
 
     @field_validator("cache_bytes", mode="before")
     @classmethod

@@ -561,6 +561,9 @@ class Evaluation:
             ", ".join(f"{p} {self.timing.get(p, 0.0):.2f}s" for p in PHASES),
             f", peak GPU memory {self.peak_memory_bytes / 2**30:.2f} GiB" if cuda else "",
         )
+        qc = getattr(self.targets, "qc", None)
+        for count in qc.counts() if qc is not None else []:
+            LOG.info("target qc %s on %s: %d values removed over %d valid times", *count.values())
         stats = self.targets.stats
         if stats:
             LOG.info(
@@ -645,6 +648,9 @@ class Evaluation:
             attrs["time_target_read_s"] = float(stats.get("read_seconds", 0.0))
             attrs["target_reads"] = int(stats.get("reads", 0))
             attrs["target_cache_hits"] = int(stats.get("cache_hits", 0))
+        qc = getattr(self.targets, "qc", None)
+        if qc is not None:
+            attrs["target_qc"] = json.dumps({"rules": qc.specs, "removed": qc.counts()}, default=str)
         for key, value in getattr(self.forecast, "stats", {}).items():
             attrs[key] = int(value)
         return attrs
@@ -1018,7 +1024,7 @@ def build(
 def _targets_from_config(block: object, forecast: ForecastSource | None) -> TargetSource:
     """The configured target source; without an `anemoi_dataset` mapping, the forecast source's own dataset."""
     options = block.anemoi_dataset if block is not None else AnemoiDatasetConfig()
-    settings = {"prefetch": options.prefetch, "cache_bytes": options.cache_bytes}
+    settings = {"prefetch": options.prefetch, "cache_bytes": options.cache_bytes, "qc": options.qc}
     kwargs = options.open_dataset_kwargs()
     if kwargs:
         return DatasetTargets(**kwargs, **settings)

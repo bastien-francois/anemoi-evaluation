@@ -22,6 +22,7 @@ from anemoi.evaluation.sources.base import MissingTargetError
 from anemoi.evaluation.sources.base import TargetSourceBase
 from anemoi.evaluation.sources.base import select_variables
 from anemoi.evaluation.sources.base import variable_info
+from anemoi.evaluation.target_qc import TargetQC
 
 DEFAULT_PREFETCH = 2
 
@@ -52,10 +53,12 @@ class DatasetTargets(TargetSourceBase):
     With `prefetch=None` the depth is 2, raised to the forecast source's frames per model call by `prefetch_hint`.
     """
 
-    def __init__(self, *args: Any, prefetch: int | None = None, cache_bytes: int = 0, **kwargs: Any) -> None:
+    def __init__(
+        self, *args: Any, prefetch: int | None = None, cache_bytes: int = 0, qc: list | None = None, **kwargs: Any
+    ) -> None:
         from anemoi.datasets import open_dataset
 
-        self._setup(open_dataset(*args, **kwargs), args, kwargs, prefetch=prefetch, cache_bytes=cache_bytes)
+        self._setup(open_dataset(*args, **kwargs), args, kwargs, prefetch=prefetch, cache_bytes=cache_bytes, qc=qc)
 
     @classmethod
     def from_dataset(
@@ -66,20 +69,23 @@ class DatasetTargets(TargetSourceBase):
         grid_indices: Any = None,
         prefetch: int | None = None,
         cache_bytes: int = 0,
+        qc: list | None = None,
     ) -> DatasetTargets:
         """Targets from an already open dataset; `grid_indices` reduces the grid as the checkpoint does."""
         targets = cls.__new__(cls)
-        targets._setup(dataset, args, kwargs or {}, grid_indices, prefetch, cache_bytes)
+        targets._setup(dataset, args, kwargs or {}, grid_indices, prefetch, cache_bytes, qc)
         return targets
 
     @classmethod
-    def from_forecast(cls, forecast: Any, prefetch: int | None = None, cache_bytes: int = 0) -> DatasetTargets:
+    def from_forecast(
+        cls, forecast: Any, prefetch: int | None = None, cache_bytes: int = 0, qc: list | None = None
+    ) -> DatasetTargets:
         """Targets from the dataset the forecast source's runner reads, so both use the same zarr."""
         from anemoi.datasets import open_dataset
 
         args, kwargs = forecast.dataset_args_kwargs()
         dataset = open_dataset(*args, **kwargs)
-        targets = cls.from_dataset(dataset, args, kwargs, forecast.grid_indices, prefetch, cache_bytes)
+        targets = cls.from_dataset(dataset, args, kwargs, forecast.grid_indices, prefetch, cache_bytes, qc)
         targets.prefetch_hint(getattr(forecast, "frames_per_pass", 1))
         return targets
 
@@ -91,6 +97,7 @@ class DatasetTargets(TargetSourceBase):
         grid_indices: Any = None,
         prefetch: int | None = None,
         cache_bytes: int = 0,
+        qc: list | None = None,
     ) -> None:
         if dataset.shape[2] != 1:
             raise ValueError(f"target datasets must have one member, got {dataset.shape[2]}")
@@ -120,6 +127,7 @@ class DatasetTargets(TargetSourceBase):
         self._cache: OrderedDict[tuple, np.ndarray] = OrderedDict()
         self._cache_size = 0
         self._stats = {"reads": 0, "read_seconds": 0.0, "cache_hits": 0}
+        self.qc = TargetQC(qc, self) if qc else None  # after the grid, variables and dates it checks against
 
     @property
     def interpolate_frequency(self) -> list:
@@ -192,7 +200,10 @@ class DatasetTargets(TargetSourceBase):
         data = self.ds[self._index[valid_time]][columns, 0][:, self.grid_indices]
         if base != requested:
             data = derive(np.asarray(data, dtype=np.float32), base, requested)
-        return np.ascontiguousarray(data, dtype=np.float32), time.perf_counter() - start
+        data = np.array(data, dtype=np.float32, order="C")  # a copy: the QC writes NaN into it
+        if self.qc is not None:
+            data = self.qc.apply(valid_time, requested, data)
+        return data, time.perf_counter() - start
 
     def _store(self, key: tuple, data: np.ndarray) -> None:
         if self.cache_bytes == 0 or data.nbytes > self.cache_bytes:
@@ -251,6 +262,7 @@ class DatasetTargets(TargetSourceBase):
             "row_bytes": int(np.prod(self.ds.shape[1:])) * itemsize,
             "prefetch": self.lookahead,
             "cache_bytes": self.cache_bytes,
+            **({"qc": self.qc.specs} if self.qc is not None else {}),
         }
 
     def to_config(self) -> dict:
@@ -262,4 +274,6 @@ class DatasetTargets(TargetSourceBase):
             options["prefetch"] = self.prefetch_given
         if self.cache_bytes:
             options["cache_bytes"] = self.cache_bytes
+        if self.qc is not None:
+            options["qc"] = self.qc.specs
         return {"anemoi_dataset": {**(self.args[0] if self.args else {}), **self.kwargs, **options}}
