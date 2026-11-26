@@ -412,6 +412,7 @@ class EvaluationConfig(_Model):
     output: OutputConfig | None = None
     on_missing_target: Literal["skip", "raise"] = "skip"
     include_lead_zero: bool = False
+    forecast_minimum: dict[str, float] | None = None
     log_level: str = "INFO"
 
     @field_validator("datasets")

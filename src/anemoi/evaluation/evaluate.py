@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import datetime
 import itertools
 import json
@@ -125,6 +126,7 @@ class Evaluation:
         include_lead_zero: bool = False,
         climatology: ClimatologySource | None = None,
         dataset: str | None = None,
+        forecast_minimum: dict[str, float] | None = None,
     ) -> None:
         self.dataset = dataset
         self.forecast = forecast
@@ -148,6 +150,14 @@ class Evaluation:
         targets.prefetch_hint(forecast.frames_per_pass)
         self.variables = self._resolve_variables(variables)
         self._check_variable_metadata()
+        # forecast values below a variable's minimum are raised to it before scoring (e.g. tp >= 0 for a model
+        # without a bounding layer); counted per variable and lead time, with the smallest value seen
+        minimum = dict(forecast_minimum or {})
+        unknown = [name for name in minimum if name not in self.variables]
+        if unknown:
+            LOG.warning("forecast_minimum: %s not scored%s, ignored", unknown, f" in {dataset}" if dataset else "")
+        self.forecast_minimum = {name: float(low) for name, low in minimum.items() if name in self.variables}
+        self._raised: dict[tuple[str, datetime.timedelta], tuple[int, float]] = {}
         self.metrics = metrics_module.build(metrics, self.variables, members=forecast.members)
         needed = metrics_module.min_members(self.metrics)
         if needed > forecast.members:
@@ -382,6 +392,7 @@ class Evaluation:
             "model_calls": calls * len(init_times),
             "computed_lead_time": frequency_to_string(computed),
             "include_lead_zero": self.include_lead_zero,
+            **({"forecast_minimum": dict(self.forecast_minimum)} if self.forecast_minimum else {}),
             "variables": {"names": list(self.variables), **self.variable_coords()},
             "metrics": [metric.spec for metric in self.metrics],
             "statistics": sorted(metrics_module.unique_statistics(self.metrics)),
@@ -520,8 +531,38 @@ class Evaluation:
         target = self._target(frame, timer, charge_model)
         if target is None:
             return
+        frame = self.apply_forecast_minimum(frame)
         self.aggregator.add(state, frame, target, self._aux(frame))
         timer.mark("statistics")
+
+    def apply_forecast_minimum(self, frame: Frame) -> Frame:
+        """`frame` with the values below `forecast_minimum` raised to it, in a copy (the model's tensors are never
+        written); NaN is left as it is. Counts the raised values and the smallest one per variable and lead time."""
+        data = None
+        for name, low in self.forecast_minimum.items():
+            if name not in frame.variables:
+                continue
+            column = frame.data[:, frame.variables.index(name)]
+            below = column < low
+            raised = int(below.sum())
+            count, smallest = self._raised.get((name, frame.lead_time), (0, math.inf))
+            if raised:
+                if data is None:
+                    data = frame.data.clone()
+                smallest = min(smallest, float(column[below].min()))
+                data[:, frame.variables.index(name)] = column.clamp(min=low).where(~column.isnan(), column)
+            self._raised[(name, frame.lead_time)] = (count + raised, smallest)
+        return frame if data is None else dataclasses.replace(frame, data=data)
+
+    def forecast_minimum_counts(self) -> dict[str, dict[str, dict]]:
+        """{variable: {lead time: {"raised": count, "smallest": value or None}}} over the frames scored so far."""
+        out: dict[str, dict[str, dict]] = {}
+        for (name, lead), (count, smallest) in sorted(self._raised.items(), key=lambda item: (item[0][0], item[0][1])):
+            out.setdefault(name, {})[frequency_to_string(lead)] = {
+                "raised": count,
+                "smallest": smallest if count else None,
+            }
+        return out
 
     def charge(
         self,
@@ -561,6 +602,13 @@ class Evaluation:
             ", ".join(f"{p} {self.timing.get(p, 0.0):.2f}s" for p in PHASES),
             f", peak GPU memory {self.peak_memory_bytes / 2**30:.2f} GiB" if cuda else "",
         )
+        for name, leads in self.forecast_minimum_counts().items():
+            LOG.info(
+                "forecast_minimum %s >= %g: %d values raised",
+                name,
+                self.forecast_minimum[name],
+                sum(entry["raised"] for entry in leads.values()),
+            )
         qc = getattr(self.targets, "qc", None)
         for count in qc.counts() if qc is not None else []:
             LOG.info("target qc %s on %s: %d values removed over %d valid times", *count.values())
@@ -608,7 +656,7 @@ class Evaluation:
             target = self._target(frame, timer)
             if target is None:
                 continue
-            yield frame, target
+            yield self.apply_forecast_minimum(frame), target
             timer.mark("statistics")
         timer.mark("model")
 
@@ -648,6 +696,10 @@ class Evaluation:
             attrs["time_target_read_s"] = float(stats.get("read_seconds", 0.0))
             attrs["target_reads"] = int(stats.get("reads", 0))
             attrs["target_cache_hits"] = int(stats.get("cache_hits", 0))
+        if self.forecast_minimum:
+            attrs["forecast_minimum"] = json.dumps(
+                {"minimum": self.forecast_minimum, "raised": self.forecast_minimum_counts()}
+            )
         qc = getattr(self.targets, "qc", None)
         if qc is not None:
             attrs["target_qc"] = json.dumps({"rules": qc.specs, "removed": qc.counts()}, default=str)
@@ -688,6 +740,7 @@ class Evaluation:
                 "bins": {"time": self.binning.kind, "by": self.binning.by},
                 "on_missing_target": self.on_missing_target,
                 "include_lead_zero": self.include_lead_zero,
+                "forecast_minimum": dict(self.forecast_minimum) or None,
                 "climatology": self.climatology.to_config() if self.climatology is not None else None,
             }
         )
@@ -855,7 +908,7 @@ class MultiEvaluation:
                         for frame in evaluation._initial_frames(init_time):
                             target = evaluation._target(frame, timer)
                             if target is not None:
-                                yield name, frame, target
+                                yield name, evaluation.apply_forecast_minimum(frame), target
                 stream = self.forecast.multi_frames(
                     init_time, self.lead_time, {name: self.evaluations[name].variables for name in names}, self.device
                 )
@@ -864,7 +917,7 @@ class MultiEvaluation:
                         for name in names:
                             target = self.evaluations[name]._target(frames[name], timer)
                             if target is not None:
-                                yield name, frames[name], target
+                                yield name, self.evaluations[name].apply_forecast_minimum(frames[name]), target
 
     def attrs(self, init_times: list[datetime.datetime] | None = None) -> dict[str, dict]:
         """The result attrs of each dataset."""
@@ -1000,6 +1053,7 @@ def build(
                 on_missing_target=config.on_missing_target,
                 include_lead_zero=config.include_lead_zero,
                 climatology=climatologies[name],
+                forecast_minimum=config.forecast_minimum,
                 dataset=name if len(available) > 1 else None,
             )
         except ValueError as error:  # a shared block that fits one dataset's grid but not another's
